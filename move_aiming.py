@@ -6,11 +6,51 @@ import math
 import os
 import sys
 import time
-from machine import FPIOA, Pin, UART
+from machine import FPIOA, Pin
 
 try:
+    from control_backends import BACKEND_LOCAL
+    from control_backends import build_control_backend
+    from control_backends import mode_code_for_name
+    from control_backends import unit_code_for_name
+    from dual_core_config import CONTROL_BACKEND
     from k230_common import load_calibration
 except ImportError:
+    BACKEND_LOCAL = "local"
+    CONTROL_BACKEND = BACKEND_LOCAL
+
+    def build_control_backend(backend_name, axis_overrides=None, mode_code=0, unit_code=0):
+        class _NoopControlBackend:
+            ready = False
+
+            def update(
+                self,
+                error_x,
+                error_y,
+                valid,
+                control_enabled,
+                target_x=None,
+                target_y=None,
+                sync_ok=True,
+                aligned=False,
+                state_name="IDLE",
+            ):
+                return
+
+            def stop(self, state_name="STOPPED"):
+                return
+
+            def deinit(self):
+                return
+
+        return _NoopControlBackend()
+
+    def mode_code_for_name(name):
+        return 0
+
+    def unit_code_for_name(name):
+        return 0
+
     def load_calibration(default_red, default_black, default_violet, default_bright=None):
         return (
             False,
@@ -68,7 +108,6 @@ BULLSEYE_CENTER_ALPHA = 0.84
 BULLSEYE_LEAD_GAIN = 0.18
 BULLSEYE_LEAD_MAX_PX = 10
 
-UART_BAUDRATE = 115200
 START_BUTTON_BOARD_PIN = 28
 START_BUTTON_GPIO_NUM = 28
 BUTTON_DEBOUNCE_MS = 35
@@ -96,6 +135,29 @@ LASER_POINT_HISTORY_LEN = 1
 RADIUS_HISTORY_LEN = 3
 BUILD_TAG = "2026-07-14-aim-fastboot-v19"
 CURRENT_SNAPSHOT_CHN = CAM_CHN_ID_1
+
+STEPPER_AXIS_OVERRIDES = {
+    "x": {
+        "deadband": 0.25,
+        "error_full_scale": 5.0,
+        "command_sign": 1,
+        "pid_kp": 180.0,
+        "pid_ki": 10.0,
+        "pid_kd": 2.5,
+        "integral_limit": 6.0,
+        "integral_active_error": 2.8,
+    },
+    "y": {
+        "deadband": 0.25,
+        "error_full_scale": 5.0,
+        "command_sign": 1,
+        "pid_kp": 180.0,
+        "pid_ki": 10.0,
+        "pid_kd": 2.5,
+        "integral_limit": 6.0,
+        "integral_active_error": 2.8,
+    },
+}
 
 
 def apply_calibration():
@@ -1186,70 +1248,29 @@ class CircleTrajectory:
 
 
 class AimingSystem:
-    def __init__(self, uart_id=2, tx_pin=5, rx_pin=6):
+    def __init__(self):
         self.detector = TargetDetector()
         self.trajectory = CircleTrajectory(CIRCLE_RADIUS_CM)
-        self.uart = None
-        self.comm_started = False
+        self.control = build_control_backend(
+            CONTROL_BACKEND,
+            axis_overrides=STEPPER_AXIS_OVERRIDES,
+            mode_code=mode_code_for_name("aim"),
+            unit_code=unit_code_for_name("cm"),
+        )
+        self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
-        self.uart_id = uart_id
-        self.tx_pin = tx_pin
-        self.rx_pin = rx_pin
         self.mode = "aim"
         self.frame_count = 0
         self.fps = 0.0
         self.last_fps_time = time.ticks_ms()
         self.gc_counter = 0
 
-    def init_uart(self):
-        try:
-            fpioa = FPIOA()
-            fpioa.set_function(self.tx_pin, fpioa.UART2_TXD)
-            fpioa.set_function(self.rx_pin, fpioa.UART2_RXD)
-            self.uart = UART(self.uart_id, baudrate=UART_BAUDRATE)
-            print(f"[UART] init ok: {UART_BAUDRATE}")
-            return True
-        except Exception as e:
-            print(f"[UART] init failed: {e}")
-            return False
-
-    def send_aiming_data(self, offset_info):
-        if self.uart is None or not self.comm_started:
-            return
-        if offset_info is None:
-            self.uart.write("AIM,SEARCH\n")
-            return
-        self.uart.write(
-            "AIM,{:.2f},{:.2f},{:.2f},{:.1f}\n".format(
-                offset_info["dx_cm"],
-                offset_info["dy_cm"],
-                offset_info["distance_cm"],
-                offset_info["angle_deg"],
-            )
-        )
-
-    def send_circle_data(self, target_dx, target_dy, current_offset):
-        if self.uart is None or not self.comm_started:
-            return
-        cur_dx = current_offset["dx_cm"] if current_offset else 0
-        cur_dy = current_offset["dy_cm"] if current_offset else 0
-        self.uart.write(
-            "CIR,{:.2f},{:.2f},{:.2f},{:.2f}\n".format(
-                target_dx, target_dy, cur_dx, cur_dy
-            )
-        )
-
-    def send_status(self, status):
-        if self.uart and self.comm_started:
-            self.uart.write("STS,{}\n".format(status))
-
     def _update_start_button(self):
-        if self.comm_started:
+        if self.control_started:
             return
         if self.start_button.poll_pressed():
-            self.comm_started = True
-            print("[Comm] start button pressed, UART enabled")
-            self.send_status(self.mode.upper())
+            self.control_started = True
+            print("[Motor] start button pressed, stepper control enabled")
 
     def process_frame(self, img):
         self.frame_count += 1
@@ -1260,10 +1281,46 @@ class AimingSystem:
         offset_info = self.detector.get_offset_info()
 
         if self.mode == "aim":
-            self.send_aiming_data(offset_info)
+            if offset_info is None:
+                self.control.update(
+                    error_x=None,
+                    error_y=None,
+                    valid=False,
+                    control_enabled=self.control_started,
+                    state_name="STOPPED",
+                )
+            else:
+                self.control.update(
+                    error_x=offset_info["dx_cm"],
+                    error_y=offset_info["dy_cm"],
+                    valid=True,
+                    control_enabled=self.control_started,
+                    aligned=False,
+                    state_name="TRACKING",
+                )
         elif self.mode == "circle":
             target_dx, target_dy = self.trajectory.get_target_point()
-            self.send_circle_data(target_dx, target_dy, offset_info)
+            if offset_info is None:
+                self.control.update(
+                    error_x=None,
+                    error_y=None,
+                    valid=False,
+                    control_enabled=self.control_started,
+                    target_x=target_dx,
+                    target_y=target_dy,
+                    state_name="STOPPED",
+                )
+            else:
+                self.control.update(
+                    error_x=target_dx - offset_info["dx_cm"],
+                    error_y=target_dy - offset_info["dy_cm"],
+                    valid=True,
+                    control_enabled=self.control_started,
+                    target_x=target_dx,
+                    target_y=target_dy,
+                    aligned=False,
+                    state_name="RUNNING",
+                )
 
         if DEBUG_MODE:
             self._draw_debug_overlay(img, offset_info)
@@ -1314,12 +1371,12 @@ class AimingSystem:
                 color=(255, 255, 255),
                 scale=1,
             )
-        if not self.comm_started:
+        if not self.control_started:
             draw_text(
                 img,
                 4,
                 FRAME_HEIGHT - 16,
-                "PRESS GPIO28 TO START UART",
+                "PRESS GPIO28 TO START MOTOR",
                 color=(255, 255, 0),
                 scale=1,
             )
@@ -1342,7 +1399,8 @@ class AimingSystem:
             self.mode = mode
             if mode == "circle":
                 self.trajectory.reset()
-            self.send_status(mode.upper())
+            if mode == "idle":
+                self.control.stop()
             print(f"[Mode] {mode}")
 
 
@@ -1354,8 +1412,7 @@ def main():
     print("=" * 50)
     apply_calibration()
 
-    aiming_system = AimingSystem(uart_id=2, tx_pin=5, rx_pin=6)
-    aiming_system.init_uart()
+    aiming_system = AimingSystem()
 
     print("[Display] init...")
     init_preview_display()
@@ -1404,8 +1461,7 @@ def main():
         time.sleep_ms(100)
         MediaManager.deinit()
         Sensor.deinit()
-        if aiming_system.uart:
-            aiming_system.uart.deinit()
+        aiming_system.control.deinit()
         print("[System] stopped")
 
 

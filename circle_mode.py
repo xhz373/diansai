@@ -6,11 +6,51 @@ import math
 import os
 import sys
 import time
-from machine import FPIOA, Pin, UART
+from machine import FPIOA, Pin
 
 try:
+    from control_backends import BACKEND_LOCAL
+    from control_backends import build_control_backend
+    from control_backends import mode_code_for_name
+    from control_backends import unit_code_for_name
+    from dual_core_config import CONTROL_BACKEND
     from k230_common import load_calibration
 except ImportError:
+    BACKEND_LOCAL = "local"
+    CONTROL_BACKEND = BACKEND_LOCAL
+
+    def build_control_backend(backend_name, axis_overrides=None, mode_code=0, unit_code=0):
+        class _NoopControlBackend:
+            ready = False
+
+            def update(
+                self,
+                error_x,
+                error_y,
+                valid,
+                control_enabled,
+                target_x=None,
+                target_y=None,
+                sync_ok=True,
+                aligned=False,
+                state_name="IDLE",
+            ):
+                return
+
+            def stop(self, state_name="STOPPED"):
+                return
+
+            def deinit(self):
+                return
+
+        return _NoopControlBackend()
+
+    def mode_code_for_name(name):
+        return 0
+
+    def unit_code_for_name(name):
+        return 0
+
     def load_calibration(default_red, default_black, default_violet, default_bright=None):
         return (
             False,
@@ -72,14 +112,6 @@ START_ALIGN_TOL_CM = 1.2
 START_ALIGN_HOLD_FRAMES = 3
 CIRCLE_SPEED_DEG_PER_SEC = 20.0
 
-PID_KP = 0.8
-PID_KI = 0.1
-PID_KD = 0.05
-
-UART_ID = 2
-TX_PIN = 5
-RX_PIN = 6
-UART_BAUDRATE = 115200
 START_BUTTON_BOARD_PIN = 28
 START_BUTTON_GPIO_NUM = 28
 BUTTON_DEBOUNCE_MS = 35
@@ -120,6 +152,29 @@ BUILD_TAG = "2026-07-14-circle-fastboot-v31"
 CURRENT_SNAPSHOT_CHN = CAM_CHN_ID_1
 ERROR_JUMP_MAX_CM = 3.0
 ERROR_JUMP_REJECT_FRAMES = 2
+
+STEPPER_AXIS_OVERRIDES = {
+    "x": {
+        "deadband": 0.20,
+        "error_full_scale": 4.0,
+        "command_sign": 1,
+        "pid_kp": 220.0,
+        "pid_ki": 12.0,
+        "pid_kd": 3.0,
+        "integral_limit": 5.0,
+        "integral_active_error": 2.2,
+    },
+    "y": {
+        "deadband": 0.20,
+        "error_full_scale": 4.0,
+        "command_sign": 1,
+        "pid_kp": 220.0,
+        "pid_ki": 12.0,
+        "pid_kd": 3.0,
+        "integral_limit": 5.0,
+        "integral_active_error": 2.2,
+    },
+}
 
 
 def apply_calibration():
@@ -1406,8 +1461,13 @@ class CircleModeSystem:
     def __init__(self):
         self.detector = TargetDetector()
         self.tracker = CircleTracker()
-        self.uart = None
-        self.comm_started = False
+        self.control = build_control_backend(
+            CONTROL_BACKEND,
+            axis_overrides=STEPPER_AXIS_OVERRIDES,
+            mode_code=mode_code_for_name("circle"),
+            unit_code=unit_code_for_name("cm"),
+        )
+        self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
         self.frame_count = 0
         self.gc_counter = 0
@@ -1452,49 +1512,6 @@ class CircleModeSystem:
         self.error_jump_count = 0
         return error_x, error_y, True
 
-    def init_uart(self):
-        try:
-            fpioa = FPIOA()
-            fpioa.set_function(TX_PIN, fpioa.UART2_TXD)
-            fpioa.set_function(RX_PIN, fpioa.UART2_RXD)
-            self.uart = UART(UART_ID, baudrate=UART_BAUDRATE)
-            print(f"[UART] OK ({UART_BAUDRATE})")
-            return True
-        except Exception as e:
-            print(f"[UART] failed: {e}")
-            return False
-
-    def send_error_command(self, error_x, error_y, sync_ok):
-        if self.uart is None or not self.comm_started:
-            return
-        sync_flag = 1 if sync_ok else 0
-        self.uart.write(
-            "CIRC,{:.3f},{:.3f},{}\n".format(error_x, error_y, sync_flag)
-        )
-
-    def send_status(self, status):
-        if self.uart and self.comm_started:
-            self.uart.write("STS,{}\n".format(status))
-
-    def _poll_uart_commands(self):
-        commands = []
-        if (not self.uart) or (not self.comm_started):
-            return commands
-        while self.uart.any():
-            try:
-                data = self.uart.readline()
-            except Exception:
-                break
-            if not data:
-                break
-            try:
-                command = data.decode("utf-8").strip()
-            except Exception:
-                continue
-            if command:
-                commands.append(command)
-        return commands
-
     def _start_point_error_cm(self):
         target = self.tracker.get_current_target()
         if (
@@ -1518,45 +1535,41 @@ class CircleModeSystem:
         return self.start_align_frames >= START_ALIGN_HOLD_FRAMES
 
     def _update_start_button(self):
-        if self.comm_started:
+        if self.control_started:
             return
         if self.start_button.poll_pressed():
-            self.comm_started = True
-            print("[Comm] start button pressed, UART enabled")
-            if self.state != "IDLE":
-                self.send_status(self.state)
+            self.control_started = True
+            print("[Motor] start button pressed, stepper control enabled")
 
     def process_frame(self, img):
         self.frame_count += 1
         self.gc_counter += 1
         self.detector.detect_all(img)
         self._update_start_button()
-        commands = self._poll_uart_commands()
 
         if self.state == "IDLE":
+            self.control.stop(state_name="IDLE")
             if self.detector.target_found and self.detector.bullseye_found:
                 self.state = "WAITING"
                 self.start_align_frames = 0
                 self.tracker.reset()
-                self.send_status("WAITING")
                 print("[State] target ready -> WAITING")
         elif self.state == "WAITING":
+            self.control.stop(state_name="WAITING")
             if self._check_start_alignment():
                 self.state = "RUNNING"
                 self.tracker.reset()
                 self.tracker.start()
                 self.start_align_frames = 0
-                self.send_status("RUNNING")
                 print("[State] laser aligned with start point -> RUNNING")
         elif self.state == "RUNNING":
-            if "STOP_CIRCLE" in commands or "STOP" in commands:
+            if not self.control_started:
                 self.state = "WAITING"
                 self.tracker.reset()
                 self.start_align_frames = 0
                 self.last_sent_error = None
                 self.error_jump_count = 0
-                self.send_status("STOPPED")
-                print("[State] stop command -> WAITING")
+                self.control.stop(state_name="STOPPED")
             else:
                 self._handle_running()
 
@@ -1582,11 +1595,31 @@ class CircleModeSystem:
 
         if quality_ok:
             filtered_x, filtered_y, stable_ok = self._filter_error_jump(error_x, error_y)
-            self.send_error_command(filtered_x, filtered_y, sync_ok and stable_ok)
+            self.control.update(
+                error_x=filtered_x,
+                error_y=filtered_y,
+                valid=True,
+                control_enabled=self.control_started,
+                target_x=target_dx,
+                target_y=target_dy,
+                sync_ok=sync_ok and stable_ok,
+                aligned=False,
+                state_name="RUNNING",
+            )
         else:
             self.last_sent_error = None
             self.error_jump_count = 0
-            self.send_error_command(0.0, 0.0, False)
+            self.control.update(
+                error_x=None,
+                error_y=None,
+                valid=False,
+                control_enabled=self.control_started,
+                target_x=target_dx,
+                target_y=target_dy,
+                sync_ok=False,
+                aligned=False,
+                state_name="STOPPED",
+            )
 
     def _draw_overlay(self, img):
         if self.detector.target_found and self.detector.target_rect:
@@ -1687,12 +1720,12 @@ class CircleModeSystem:
                         color=(255, 255, 255),
                         scale=1,
                     )
-        if not self.comm_started:
+        if not self.control_started:
             draw_text(
                 img,
                 10,
                 FRAME_HEIGHT - 20,
-                "PRESS GPIO28 TO START UART",
+                "PRESS GPIO28 TO START MOTOR",
                 color=(255, 255, 0),
                 scale=1,
             )
@@ -1711,7 +1744,6 @@ def main():
     start_camera(sensor)
 
     system = CircleModeSystem()
-    system.init_uart()
     print("system ready")
 
     try:
@@ -1743,8 +1775,7 @@ def main():
         time.sleep_ms(100)
         MediaManager.deinit()
         Sensor.deinit()
-        if system.uart:
-            system.uart.deinit()
+        system.control.deinit()
         print("system stopped")
 
 

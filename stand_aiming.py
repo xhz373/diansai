@@ -6,7 +6,49 @@ import math
 import os
 import sys
 import time
-from machine import FPIOA, Pin, UART
+from machine import FPIOA, Pin
+
+try:
+    from control_backends import BACKEND_LOCAL
+    from control_backends import build_control_backend
+    from control_backends import mode_code_for_name
+    from control_backends import unit_code_for_name
+    from dual_core_config import CONTROL_BACKEND
+except ImportError:
+    BACKEND_LOCAL = "local"
+    CONTROL_BACKEND = BACKEND_LOCAL
+
+    def build_control_backend(backend_name, axis_overrides=None, mode_code=0, unit_code=0):
+        class _NoopControlBackend:
+            ready = False
+
+            def update(
+                self,
+                error_x,
+                error_y,
+                valid,
+                control_enabled,
+                target_x=None,
+                target_y=None,
+                sync_ok=True,
+                aligned=False,
+                state_name="IDLE",
+            ):
+                return
+
+            def stop(self, state_name="STOPPED"):
+                return
+
+            def deinit(self):
+                return
+
+        return _NoopControlBackend()
+
+    def mode_code_for_name(name):
+        return 0
+
+    def unit_code_for_name(name):
+        return 0
 
 
 CAMERA_ID = 2
@@ -15,10 +57,6 @@ FRAME_HEIGHT = 300
 SENSOR_HMIRROR = True
 SENSOR_VFLIP = True
 
-UART_ID = 2
-TX_PIN = 5
-RX_PIN = 6
-UART_BAUDRATE = 115200
 START_BUTTON_BOARD_PIN = 28
 START_BUTTON_GPIO_NUM = 28
 BUTTON_DEBOUNCE_MS = 35
@@ -72,6 +110,29 @@ MAX_CONSECUTIVE_SNAPSHOT_FAILURES = 5
 
 BUILD_TAG = "2026-07-14-rect-center-v1"
 CURRENT_SNAPSHOT_CHN = CAM_CHN_ID_1
+
+STEPPER_AXIS_OVERRIDES = {
+    "x": {
+        "deadband": float(ALIGNED_TOLERANCE_PX),
+        "error_full_scale": 100.0,
+        "command_sign": 1,
+        "pid_kp": 16.0,
+        "pid_ki": 0.25,
+        "pid_kd": 0.9,
+        "integral_limit": 120.0,
+        "integral_active_error": 36.0,
+    },
+    "y": {
+        "deadband": float(ALIGNED_TOLERANCE_PX),
+        "error_full_scale": 80.0,
+        "command_sign": 1,
+        "pid_kp": 16.0,
+        "pid_ki": 0.25,
+        "pid_kd": 0.9,
+        "integral_limit": 120.0,
+        "integral_active_error": 36.0,
+    },
+}
 
 
 def draw_text(img, x, y, text, color=(255, 255, 255), scale=1):
@@ -636,8 +697,13 @@ class RectTracker:
 class RectCenterSystem:
     def __init__(self):
         self.tracker = RectTracker()
-        self.uart = None
-        self.comm_started = False
+        self.control = build_control_backend(
+            CONTROL_BACKEND,
+            axis_overrides=STEPPER_AXIS_OVERRIDES,
+            mode_code=mode_code_for_name("stand"),
+            unit_code=unit_code_for_name("pixel"),
+        )
+        self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
         self.frame_count = 0
         self.fps = 0.0
@@ -646,41 +712,12 @@ class RectCenterSystem:
         self.last_aligned = False
         self._aligned_latched = False
 
-    def init_uart(self):
-        try:
-            fpioa = FPIOA()
-            fpioa.set_function(TX_PIN, fpioa.UART2_TXD)
-            fpioa.set_function(RX_PIN, fpioa.UART2_RXD)
-            self.uart = UART(UART_ID, baudrate=UART_BAUDRATE)
-            print("[UART] init ok:", UART_BAUDRATE)
-            return True
-        except Exception as e:
-            print("[UART] init failed:", e)
-            return False
-
-    def send_status(self, status):
-        if self.uart and self.comm_started:
-            self.uart.write("STS,{}\n".format(status))
-
-    def send_search(self):
-        if self.uart and self.comm_started:
-            self.uart.write("RECT,SEARCH\n")
-
-    def send_offset(self, dx, dy):
-        if self.uart and self.comm_started:
-            self.uart.write("RECT,{},{},{}\n".format(dx, dy, 1 if self.last_aligned else 0))
-
-    def send_aligned(self):
-        if self.uart and self.comm_started:
-            self.uart.write("RECT_OK\n")
-
     def _update_start_button(self):
-        if self.comm_started:
+        if self.control_started:
             return
         if self.start_button.poll_pressed():
-            self.comm_started = True
-            print("[Comm] start button pressed, UART enabled")
-            self.send_status("RECT_CENTER_READY")
+            self.control_started = True
+            print("[Motor] start button pressed, stepper control enabled")
 
     def process_frame(self, img):
         self.frame_count += 1
@@ -694,7 +731,14 @@ class RectCenterSystem:
         if not found or rect is None or center is None:
             self.last_aligned = False
             self._aligned_latched = False
-            self.send_search()
+            self.control.update(
+                error_x=None,
+                error_y=None,
+                valid=False,
+                control_enabled=self.control_started,
+                aligned=False,
+                state_name="STOPPED",
+            )
             if DEBUG_MODE:
                 self._draw_overlay(img, None, None, screen_center, target_point, False)
             return img
@@ -703,9 +747,14 @@ class RectCenterSystem:
         dy = center[1] - target_point[1]
         aligned = abs(dx) <= ALIGNED_TOLERANCE_PX and abs(dy) <= ALIGNED_TOLERANCE_PX
         self.last_aligned = aligned
-        self.send_offset(dx, dy)
-        if aligned and not self._aligned_latched:
-            self.send_aligned()
+        self.control.update(
+            error_x=dx,
+            error_y=dy,
+            valid=True,
+            control_enabled=self.control_started,
+            aligned=aligned,
+            state_name="TRACKING",
+        )
         self._aligned_latched = aligned
 
         if DEBUG_MODE:
@@ -735,8 +784,8 @@ class RectCenterSystem:
             draw_text(img, 4, 22, "fps={:.1f}".format(self.fps))
             draw_text(img, 4, 40, "aligned={}".format(1 if aligned else 0))
             draw_text(img, 4, 58, "z={}".format(TARGET_POINT_OFFSET_Z))
-        if not self.comm_started:
-            draw_text(img, 4, FRAME_HEIGHT - 18, "PRESS GPIO28 TO START UART", color=(255, 255, 0), scale=1)
+        if not self.control_started:
+            draw_text(img, 4, FRAME_HEIGHT - 18, "PRESS GPIO28 TO START MOTOR", color=(255, 255, 0), scale=1)
 
     def update_fps(self):
         current_time = time.ticks_ms()
@@ -760,7 +809,6 @@ def main():
     print("=" * 50)
 
     system = RectCenterSystem()
-    system.init_uart()
 
     print("[Display] init...")
     init_preview_display()
@@ -809,8 +857,7 @@ def main():
         time.sleep_ms(100)
         MediaManager.deinit()
         Sensor.deinit()
-        if system.uart:
-            system.uart.deinit()
+        system.control.deinit()
         print("[System] stopped")
 
 
