@@ -1,12 +1,13 @@
-from media.sensor import *
-from media.display import *
-from media.media import *
 import gc
 import math
 import os
 import sys
 import time
-from machine import FPIOA, Pin
+
+from common_hw import (DebouncedButton as StartButton, Display, draw_text,
+                        camera_init, camera_start, camera_snapshot,
+                        camera_restart, camera_deinit,
+                        display_init)
 
 try:
     from k230_common import build_stepper_controller, load_calibration
@@ -89,7 +90,6 @@ CIRCLE_SPEED_DEG_PER_SEC = 20.0
 
 START_BUTTON_BOARD_PIN = 28
 START_BUTTON_GPIO_NUM = 28
-BUTTON_DEBOUNCE_MS = 35
 
 DEBUG_MODE = True
 DEBUG_TEXT_OVERLAY = False
@@ -111,20 +111,10 @@ RING_MIN_CLUSTER_WEIGHT = 3.0
 RING_BLOB_MIN_SIZE_PX = 2
 RING_BLOB_MAX_SIZE_DIV = 8
 POINT_HISTORY_LEN = 1
-DISPLAY_FPS = 30
 FRAME_LOOP_DELAY_MS = 0
-SNAPSHOT_RETRY_COUNT = 3
-SNAPSHOT_RETRY_DELAY_MS = 3
-SENSOR_WARMUP_FRAMES = 2
-START_CAMERA_RETRY_COUNT = 2
-START_CAMERA_RETRY_DELAY_MS = 10
-START_CAMERA_SETTLE_MS = 28
-START_CAMERA_SETTLE_STEP_MS = 18
-ALLOW_CHANNEL_FALLBACK = False
 OVERLAY_RING_SAMPLE_COUNT = 18
 GC_FRAME_INTERVAL = 180
 BUILD_TAG = "2026-07-14-circle-fastboot-v31"
-CURRENT_SNAPSHOT_CHN = CAM_CHN_ID_1
 ERROR_JUMP_MAX_CM = 3.0
 ERROR_JUMP_REJECT_FRAMES = 2
 
@@ -164,260 +154,6 @@ def apply_calibration():
         print("[Calib] thresholds applied")
     else:
         print("[Calib] using built-in thresholds")
-
-
-def _snapshot_channel_name(snapshot_chn):
-    if snapshot_chn == CAM_CHN_ID_1:
-        return "chn1"
-    return "chn0"
-
-
-def _configure_sensor_for_channel(sensor, camera_id, snapshot_chn):
-    sensor.reset()
-    try:
-        sensor.set_hmirror(SENSOR_HMIRROR)
-    except Exception:
-        pass
-    try:
-        sensor.set_vflip(SENSOR_VFLIP)
-    except Exception:
-        pass
-    if snapshot_chn == CAM_CHN_ID_1:
-        sensor.set_framesize(Sensor.FHD)
-        sensor.set_pixformat(Sensor.YUV420SP)
-        sensor.set_framesize(width=FRAME_WIDTH, height=FRAME_HEIGHT, chn=CAM_CHN_ID_1)
-        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
-    else:
-        sensor.set_framesize(width=FRAME_WIDTH, height=FRAME_HEIGHT)
-        sensor.set_pixformat(Sensor.RGB565)
-
-
-def _snapshot_once(sensor, snapshot_chn):
-    if snapshot_chn == CAM_CHN_ID_1:
-        return sensor.snapshot(chn=CAM_CHN_ID_1)
-    return sensor.snapshot(chn=CAM_CHN_ID_0)
-
-
-def init_camera_sensor(camera_id=None):
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    try:
-        sensor = Sensor(id=camera_id)
-    except OSError as e:
-        if "already inited" not in str(e):
-            raise
-        Sensor.deinit()
-        time.sleep_ms(20)
-        sensor = Sensor(id=camera_id)
-    return sensor
-
-
-def _start_camera_on_channel(sensor, camera_id, snapshot_chn):
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    last_error = None
-    for attempt in range(START_CAMERA_RETRY_COUNT):
-        os.exitpoint()
-        try:
-            MediaManager.init()
-            sensor.run()
-            settle_ms = START_CAMERA_SETTLE_MS + attempt * START_CAMERA_SETTLE_STEP_MS
-            time.sleep_ms(settle_ms)
-            for _ in range(SENSOR_WARMUP_FRAMES):
-                os.exitpoint()
-                try:
-                    _snapshot_once(sensor, snapshot_chn)
-                    return True
-                except Exception as e:
-                    last_error = e
-                    time.sleep_ms(SNAPSHOT_RETRY_DELAY_MS)
-            last_error = RuntimeError(
-                "camera id {} no warmup frames on {}".format(
-                    camera_id, _snapshot_channel_name(snapshot_chn)
-                )
-            )
-        except Exception as e:
-            last_error = e
-
-        try:
-            sensor.stop()
-        except Exception:
-            pass
-        try:
-            MediaManager.deinit()
-        except Exception:
-            pass
-        try:
-            _configure_sensor_for_channel(sensor, camera_id, snapshot_chn)
-        except Exception:
-            pass
-        gc.collect()
-        time.sleep_ms(START_CAMERA_RETRY_DELAY_MS)
-
-    raise last_error
-
-
-def start_camera(sensor, camera_id=None):
-    global CURRENT_SNAPSHOT_CHN
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    last_error = None
-    channels = (CAM_CHN_ID_1,)
-    if ALLOW_CHANNEL_FALLBACK:
-        channels = (CAM_CHN_ID_1, CAM_CHN_ID_0)
-    for snapshot_chn in channels:
-        os.exitpoint()
-        try:
-            _configure_sensor_for_channel(sensor, camera_id, snapshot_chn)
-            _start_camera_on_channel(sensor, camera_id, snapshot_chn)
-            CURRENT_SNAPSHOT_CHN = snapshot_chn
-            return True
-        except Exception as e:
-            last_error = e
-            try:
-                sensor.stop()
-            except Exception:
-                pass
-            try:
-                MediaManager.deinit()
-            except Exception:
-                pass
-            gc.collect()
-            time.sleep_ms(START_CAMERA_RETRY_DELAY_MS)
-    raise last_error
-
-
-def snapshot_with_retry(sensor):
-    last_error = None
-    for _ in range(SNAPSHOT_RETRY_COUNT):
-        os.exitpoint()
-        try:
-            return _snapshot_once(sensor, CURRENT_SNAPSHOT_CHN)
-        except RuntimeError as e:
-            last_error = e
-            gc.collect()
-            time.sleep_ms(SNAPSHOT_RETRY_DELAY_MS)
-    raise last_error
-
-
-def draw_text(img, x, y, text, color=(255, 255, 255), scale=1):
-    text = str(text)
-    if hasattr(img, "draw_string_advanced"):
-        img.draw_string_advanced(x, y, max(16, 16 * scale), text, color=color)
-    else:
-        img.draw_string(x, y, text, color=color, scale=scale)
-
-
-def _pin_pull_up_value():
-    for name in ("PULL_UP", "PULLUP", "PULL_UP_ENABLE"):
-        value = getattr(Pin, name, None)
-        if value is not None:
-            return value
-    return None
-
-
-def _map_board_pin_to_gpio(fpioa, board_pin, gpio_num):
-    if not hasattr(fpioa, "set_function"):
-        return
-    for func_name in (
-        "GPIO{}_FUNC".format(gpio_num),
-        "GPIO{}".format(gpio_num),
-        "GPIOHS{}".format(gpio_num),
-        "GPIOHS{}_FUNC".format(gpio_num),
-    ):
-        func = getattr(fpioa, func_name, None)
-        if func is not None:
-            fpioa.set_function(board_pin, func)
-            return
-
-
-class StartButton:
-    def __init__(self, board_pin, gpio_num):
-        self.pin = None
-        self.ready = False
-        self.latched = False
-        self.last_raw_value = 1
-        self.stable_value = 1
-        self.last_change_ms = 0
-        self._init_pin(board_pin, gpio_num)
-
-    def _init_pin(self, board_pin, gpio_num):
-        try:
-            fpioa = FPIOA()
-            _map_board_pin_to_gpio(fpioa, board_pin, gpio_num)
-            pull_up = _pin_pull_up_value()
-            if pull_up is None:
-                try:
-                    self.pin = Pin(gpio_num, Pin.IN)
-                except Exception:
-                    self.pin = Pin(board_pin, Pin.IN)
-            else:
-                try:
-                    self.pin = Pin(gpio_num, Pin.IN, pull_up)
-                except Exception:
-                    self.pin = Pin(board_pin, Pin.IN, pull_up)
-            self.ready = self.pin is not None
-        except Exception as e:
-            print("[Key] start init failed:", e)
-            self.pin = None
-            self.ready = False
-
-    def poll_pressed(self):
-        if self.latched or self.pin is None:
-            return self.latched
-        now = time.ticks_ms()
-        try:
-            raw_value = self.pin.value()
-        except Exception:
-            return False
-        if raw_value != self.last_raw_value:
-            self.last_raw_value = raw_value
-            self.last_change_ms = now
-            return False
-        if time.ticks_diff(now, self.last_change_ms) < BUTTON_DEBOUNCE_MS:
-            return False
-        if raw_value != self.stable_value:
-            self.stable_value = raw_value
-            if self.stable_value == 0:
-                self.latched = True
-                return True
-        return False
-
-
-def init_preview_display():
-    try:
-        Display.init(
-            Display.VIRT, width=FRAME_WIDTH, height=FRAME_HEIGHT, fps=100, to_ide=True
-        )
-        print("[Display] VIRT preview")
-    except Exception as e:
-        print(f"[Display] VIRT failed: {e}")
-        Display.init(Display.ST7701, to_ide=True)
-        print("[Display] ST7701 preview")
-
-
-def restart_camera(sensor):
-    os.exitpoint()
-    print("[Sensor] restarting...")
-    try:
-        if isinstance(sensor, Sensor):
-            sensor.stop()
-    except Exception:
-        pass
-    try:
-        MediaManager.deinit()
-    except Exception:
-        pass
-    try:
-        Sensor.deinit()
-    except Exception:
-        pass
-    gc.collect()
-    time.sleep_ms(20)
-    sensor = init_camera_sensor()
-    start_camera(sensor)
-    print("[Sensor] restart done")
-    return sensor
 
 
 class CircleTracker:
@@ -468,29 +204,6 @@ class CircleTracker:
         self.start_ms = None
         self.current_angle_deg = 0.0
         self.lap_count = 0
-
-
-class PIDController:
-    def __init__(self, kp, ki, kd):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.max_integral = 10.0
-        self.reset()
-
-    def compute(self, error, dt=0.033):
-        if dt <= 0:
-            dt = 0.001
-
-        self.integral += error * dt
-        self.integral = max(-self.max_integral, min(self.max_integral, self.integral))
-        derivative = (error - self.last_error) / dt
-        self.last_error = error
-        return self.kp * error + self.ki * self.integral + self.kd * derivative
-
-    def reset(self):
-        self.integral = 0.0
-        self.last_error = 0.0
 
 
 class TargetDetector:
@@ -1693,9 +1406,11 @@ def main():
     print("=" * 50)
     apply_calibration()
 
-    init_preview_display()
-    sensor = init_camera_sensor()
-    start_camera(sensor)
+    display_init(FRAME_WIDTH, FRAME_HEIGHT)
+    kw = dict(camera_id=CAMERA_ID, width=FRAME_WIDTH, height=FRAME_HEIGHT,
+              hmirror=SENSOR_HMIRROR, vflip=SENSOR_VFLIP)
+    sensor = camera_init(CAMERA_ID)
+    camera_start(sensor, **kw)
 
     system = CircleModeSystem()
     print("system ready")
@@ -1704,11 +1419,11 @@ def main():
         while True:
             os.exitpoint()
             try:
-                img = snapshot_with_retry(sensor)
+                img = camera_snapshot(sensor)
             except RuntimeError as e:
-                print(f"[Sensor] snapshot failed, retry by restart: {e}")
-                sensor = restart_camera(sensor)
-                img = snapshot_with_retry(sensor)
+                print("[Sensor] snapshot failed, retry:", e)
+                sensor = camera_restart(sensor, **kw)
+                img = camera_snapshot(sensor)
             img = system.process_frame(img)
             Display.show_image(img)
             time.sleep_ms(FRAME_LOOP_DELAY_MS)
@@ -1719,16 +1434,10 @@ def main():
     except KeyboardInterrupt:
         print("\nuser interrupted")
     except Exception as e:
-        print(f"error: {e}")
+        print("error:", e)
         sys.print_exception(e)
     finally:
-        if isinstance(sensor, Sensor):
-            sensor.stop()
-        Display.deinit()
-        os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
-        time.sleep_ms(100)
-        MediaManager.deinit()
-        Sensor.deinit()
+        camera_deinit(sensor)
         system.motor.deinit()
         print("system stopped")
 

@@ -1,26 +1,21 @@
-from media.sensor import *
-from media.display import *
-from media.media import *
 import gc
 import image
 import os
 import sys
 import time
-from machine import FPIOA, Pin
+
+from common_hw import (Display, MultiButton, draw_text,
+                        camera_init, camera_start, camera_snapshot,
+                        camera_deinit,
+                        init_board_display)
 
 try:
     from k230_common import load_calibration, save_calibration
 except ImportError:
-    def load_calibration(default_red, default_black, default_violet, default_bright=None):
-        return (
-            False,
-            tuple(default_red),
-            tuple(default_black),
-            tuple(default_violet),
-            default_bright,
-        )
+    def load_calibration(*a):
+        return (False,) + tuple(a[1:])
 
-    def save_calibration(red_threshold, black_threshold, violet_threshold, bright_threshold=None):
+    def save_calibration(*a):
         return False
 
 
@@ -37,7 +32,6 @@ BLACK_THRESHOLD = (22, 69, -23, -3, -22, 16)
 VIOLET_THRESHOLD = (92, 100, -15, 6, -9, 11)
 
 BUILD_TAG = "2026-07-14-key-calib-v2"
-CURRENT_SNAPSHOT_CHN = CAM_CHN_ID_1
 SNAPSHOT_RETRY_COUNT = 3
 SNAPSHOT_RETRY_DELAY_MS = 8
 START_CAMERA_RETRY_COUNT = 3
@@ -70,269 +64,6 @@ LAB_LABELS = ("L Min", "L Max", "A Min", "A Max", "B Min", "B Max")
 TARGET_NAMES = ("RECT", "LASER")
 
 
-def draw_text(img, x, y, text, color=(255, 255, 255), scale=1):
-    text = str(text)
-    if hasattr(img, "draw_string_advanced"):
-        img.draw_string_advanced(x, y, max(16, 16 * scale), text, color=color)
-    else:
-        img.draw_string(x, y, text, color=color, scale=scale)
-
-
-def _snapshot_channel_name(snapshot_chn):
-    if snapshot_chn == CAM_CHN_ID_1:
-        return "chn1"
-    return "chn0"
-
-
-def _configure_sensor_for_channel(sensor, camera_id, snapshot_chn):
-    sensor.reset()
-    try:
-        sensor.set_hmirror(SENSOR_HMIRROR)
-    except Exception:
-        pass
-    try:
-        sensor.set_vflip(SENSOR_VFLIP)
-    except Exception:
-        pass
-    if snapshot_chn == CAM_CHN_ID_1:
-        sensor.set_framesize(Sensor.FHD)
-        sensor.set_pixformat(Sensor.YUV420SP)
-        sensor.set_framesize(width=FRAME_WIDTH, height=FRAME_HEIGHT, chn=CAM_CHN_ID_1)
-        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
-    else:
-        sensor.set_framesize(width=FRAME_WIDTH, height=FRAME_HEIGHT)
-        sensor.set_pixformat(Sensor.RGB565)
-
-
-def _snapshot_once(sensor, snapshot_chn):
-    if snapshot_chn == CAM_CHN_ID_1:
-        return sensor.snapshot(chn=CAM_CHN_ID_1)
-    return sensor.snapshot(chn=CAM_CHN_ID_0)
-
-
-def init_camera_sensor(camera_id=None):
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    try:
-        sensor = Sensor(id=camera_id)
-    except OSError as e:
-        if "already inited" not in str(e):
-            raise
-        Sensor.deinit()
-        time.sleep_ms(100)
-        sensor = Sensor(id=camera_id)
-    _configure_sensor_for_channel(sensor, camera_id, CAM_CHN_ID_1)
-    return sensor
-
-
-def _start_camera_on_channel(sensor, camera_id, snapshot_chn):
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    last_error = None
-    for _ in range(START_CAMERA_RETRY_COUNT):
-        os.exitpoint()
-        success_frames = 0
-        try:
-            MediaManager.init()
-            sensor.run()
-            time.sleep_ms(120)
-            for _ in range(SENSOR_WARMUP_FRAMES):
-                os.exitpoint()
-                try:
-                    _snapshot_once(sensor, snapshot_chn)
-                    success_frames += 1
-                except Exception as e:
-                    last_error = e
-                    time.sleep_ms(SNAPSHOT_RETRY_DELAY_MS)
-            if success_frames > 0:
-                return True
-            last_error = RuntimeError(
-                "camera id {} no warmup frames on {}".format(
-                    camera_id, _snapshot_channel_name(snapshot_chn)
-                )
-            )
-        except Exception as e:
-            last_error = e
-
-        try:
-            sensor.stop()
-        except Exception:
-            pass
-        try:
-            MediaManager.deinit()
-        except Exception:
-            pass
-        try:
-            _configure_sensor_for_channel(sensor, camera_id, snapshot_chn)
-        except Exception:
-            pass
-        gc.collect()
-        time.sleep_ms(START_CAMERA_RETRY_DELAY_MS)
-
-    raise last_error
-
-
-def start_camera(sensor, camera_id=None):
-    global CURRENT_SNAPSHOT_CHN
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    last_error = None
-    for snapshot_chn in (CAM_CHN_ID_1, CAM_CHN_ID_0):
-        os.exitpoint()
-        try:
-            _configure_sensor_for_channel(sensor, camera_id, snapshot_chn)
-            _start_camera_on_channel(sensor, camera_id, snapshot_chn)
-            CURRENT_SNAPSHOT_CHN = snapshot_chn
-            print("[Sensor] snapshot channel:", _snapshot_channel_name(snapshot_chn))
-            return True
-        except Exception as e:
-            last_error = e
-            try:
-                sensor.stop()
-            except Exception:
-                pass
-            try:
-                MediaManager.deinit()
-            except Exception:
-                pass
-            gc.collect()
-            time.sleep_ms(START_CAMERA_RETRY_DELAY_MS)
-    raise last_error
-
-
-def snapshot_with_retry(sensor):
-    last_error = None
-    for _ in range(SNAPSHOT_RETRY_COUNT):
-        os.exitpoint()
-        try:
-            return _snapshot_once(sensor, CURRENT_SNAPSHOT_CHN)
-        except RuntimeError as e:
-            last_error = e
-            time.sleep_ms(SNAPSHOT_RETRY_DELAY_MS)
-    raise last_error
-
-
-def init_board_display():
-    Display.init(Display.ST7701, to_ide=True)
-    print("[Display] ST7701 key preview")
-
-
-def _pin_pull_up_value():
-    for name in ("PULL_UP", "PULLUP", "PULL_UP_ENABLE"):
-        value = getattr(Pin, name, None)
-        if value is not None:
-            return value
-    return None
-
-
-def _map_board_pin_to_gpio(fpioa, board_pin, gpio_num):
-    if not hasattr(fpioa, "set_function"):
-        return
-    for func_name in (
-        "GPIO{}_FUNC".format(gpio_num),
-        "GPIO{}".format(gpio_num),
-        "GPIOHS{}".format(gpio_num),
-        "GPIOHS{}_FUNC".format(gpio_num),
-    ):
-        func = getattr(fpioa, func_name, None)
-        if func is not None:
-            fpioa.set_function(board_pin, func)
-            return
-
-
-class ButtonInput:
-    def __init__(self):
-        self.buttons = {}
-        self._init_error = ""
-        self._init_buttons()
-
-    def _init_buttons(self):
-        try:
-            fpioa = FPIOA()
-            pull_up = _pin_pull_up_value()
-            for name, board_pin, gpio_num in BUTTON_CONFIGS:
-                try:
-                    _map_board_pin_to_gpio(fpioa, board_pin, gpio_num)
-                    if pull_up is None:
-                        try:
-                            pin = Pin(gpio_num, Pin.IN)
-                        except Exception:
-                            pin = Pin(board_pin, Pin.IN)
-                    else:
-                        try:
-                            pin = Pin(gpio_num, Pin.IN, pull_up)
-                        except Exception:
-                            pin = Pin(board_pin, Pin.IN, pull_up)
-                    self.buttons[name] = {
-                        "pin": pin,
-                        "pressed": False,
-                        "stable_value": 1,
-                        "last_raw_value": 1,
-                        "last_change_ms": 0,
-                        "down_ms": 0,
-                        "last_repeat_ms": 0,
-                        "long_fired": False,
-                    }
-                except Exception as e:
-                    self._init_error += "{}:{}; ".format(name, e)
-            if self.buttons:
-                print("[Keys] ready:", ",".join(self.buttons.keys()))
-            else:
-                print("[Keys] init failed")
-        except Exception as e:
-            self._init_error = str(e)
-            print("[Keys] init failed:", e)
-
-    def poll_events(self):
-        events = []
-        now = time.ticks_ms()
-        for name in self.buttons:
-            state = self.buttons[name]
-            try:
-                raw_value = state["pin"].value()
-            except Exception:
-                continue
-            if raw_value != state["last_raw_value"]:
-                state["last_raw_value"] = raw_value
-                state["last_change_ms"] = now
-                continue
-            if time.ticks_diff(now, state["last_change_ms"]) < BUTTON_DEBOUNCE_MS:
-                continue
-            if raw_value != state["stable_value"]:
-                state["stable_value"] = raw_value
-
-            is_down = (state["stable_value"] == 0)
-
-            if is_down and not state["pressed"]:
-                state["pressed"] = True
-                state["down_ms"] = now
-                state["last_repeat_ms"] = now
-                state["long_fired"] = False
-                events.append((name, "press"))
-                continue
-
-            if is_down and state["pressed"]:
-                hold_ms = time.ticks_diff(now, state["down_ms"])
-                if (not state["long_fired"]) and hold_ms >= BUTTON_LONG_PRESS_MS:
-                    state["long_fired"] = True
-                    state["last_repeat_ms"] = now
-                    events.append((name, "long"))
-                elif name in ("KEY3", "KEY4") and hold_ms >= BUTTON_REPEAT_DELAY_MS:
-                    if time.ticks_diff(now, state["last_repeat_ms"]) >= BUTTON_REPEAT_MS:
-                        state["last_repeat_ms"] = now
-                        events.append((name, "repeat"))
-                continue
-
-            if (not is_down) and state["pressed"]:
-                state["pressed"] = False
-                if not state["long_fired"]:
-                    events.append((name, "short"))
-        return events
-
-    def is_ready(self):
-        return len(self.buttons) == 4
-
-
 class ThresholdCalibrator:
     def __init__(self):
         ok, red, black, violet, _ = load_calibration(
@@ -347,7 +78,7 @@ class ThresholdCalibrator:
         self.active_param_index = 0
         self.status_text = "CALIB READY" if ok else "BUILT-IN THRESHOLDS"
         self.status_expire_ms = 0
-        self.keys = ButtonInput()
+        self.keys = MultiButton(BUTTON_CONFIGS)
         self.last_event_text = ""
         self.canvas = self._create_canvas()
 
@@ -533,8 +264,8 @@ class ThresholdCalibrator:
         draw_text(self.canvas, 18, 406, "keys ready: {}".format(self.keys.is_ready()), color=(255, 255, 255), scale=1)
         if self.last_event_text:
             draw_text(self.canvas, 18, 430, self.last_event_text[:36], color=(160, 255, 255), scale=1)
-        if self.keys._init_error:
-            draw_text(self.canvas, 18, 452, str(self.keys._init_error)[:36], color=(255, 128, 128), scale=1)
+        if self.keys._error:
+            draw_text(self.canvas, 18, 452, str(self.keys._error)[:36], color=(255, 128, 128), scale=1)
         elif status:
             draw_text(self.canvas, 18, 452, status, color=(255, 255, 0), scale=1)
 
@@ -554,15 +285,17 @@ def main():
 
     init_board_display()
     calibrator = ThresholdCalibrator()
-    sensor = init_camera_sensor()
-    start_camera(sensor)
+    kw = dict(camera_id=CAMERA_ID, width=FRAME_WIDTH, height=FRAME_HEIGHT,
+              hmirror=SENSOR_HMIRROR, vflip=SENSOR_VFLIP)
+    sensor = camera_init(CAMERA_ID)
+    camera_start(sensor, **kw)
 
     try:
         while True:
             os.exitpoint()
             calibrator.handle_keys()
             try:
-                img = snapshot_with_retry(sensor)
+                img = camera_snapshot(sensor)
             except RuntimeError as e:
                 print("[Sensor] snapshot failed:", e)
                 gc.collect()
@@ -577,13 +310,7 @@ def main():
         print("[Calib] error:", e)
         sys.print_exception(e)
     finally:
-        if isinstance(sensor, Sensor):
-            sensor.stop()
-        Display.deinit()
-        os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
-        time.sleep_ms(100)
-        MediaManager.deinit()
-        Sensor.deinit()
+        camera_deinit(sensor)
         print("[Calib] stopped")
 
 
