@@ -9,46 +9,22 @@ import time
 from machine import FPIOA, Pin
 
 try:
-    from control_backends import BACKEND_LOCAL
-    from control_backends import build_control_backend
-    from control_backends import mode_code_for_name
-    from control_backends import unit_code_for_name
-    from dual_core_config import CONTROL_BACKEND
+    from k230_common import build_stepper_controller
 except ImportError:
-    BACKEND_LOCAL = "local"
-    CONTROL_BACKEND = BACKEND_LOCAL
-
-    def build_control_backend(backend_name, axis_overrides=None, mode_code=0, unit_code=0):
-        class _NoopControlBackend:
+    def build_stepper_controller(axis_overrides=None):
+        class _NoopStepperController:
             ready = False
 
-            def update(
-                self,
-                error_x,
-                error_y,
-                valid,
-                control_enabled,
-                target_x=None,
-                target_y=None,
-                sync_ok=True,
-                aligned=False,
-                state_name="IDLE",
-            ):
+            def drive(self, error_x, error_y, allow_drive=True):
                 return
 
-            def stop(self, state_name="STOPPED"):
+            def stop(self):
                 return
 
             def deinit(self):
                 return
 
-        return _NoopControlBackend()
-
-    def mode_code_for_name(name):
-        return 0
-
-    def unit_code_for_name(name):
-        return 0
+        return _NoopStepperController()
 
 
 CAMERA_ID = 2
@@ -697,12 +673,7 @@ class RectTracker:
 class RectCenterSystem:
     def __init__(self):
         self.tracker = RectTracker()
-        self.control = build_control_backend(
-            CONTROL_BACKEND,
-            axis_overrides=STEPPER_AXIS_OVERRIDES,
-            mode_code=mode_code_for_name("stand"),
-            unit_code=unit_code_for_name("pixel"),
-        )
+        self.motor = build_stepper_controller(STEPPER_AXIS_OVERRIDES)
         self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
         self.frame_count = 0
@@ -731,14 +702,7 @@ class RectCenterSystem:
         if not found or rect is None or center is None:
             self.last_aligned = False
             self._aligned_latched = False
-            self.control.update(
-                error_x=None,
-                error_y=None,
-                valid=False,
-                control_enabled=self.control_started,
-                aligned=False,
-                state_name="STOPPED",
-            )
+            self.motor.stop()
             if DEBUG_MODE:
                 self._draw_overlay(img, None, None, screen_center, target_point, False)
             return img
@@ -747,14 +711,7 @@ class RectCenterSystem:
         dy = center[1] - target_point[1]
         aligned = abs(dx) <= ALIGNED_TOLERANCE_PX and abs(dy) <= ALIGNED_TOLERANCE_PX
         self.last_aligned = aligned
-        self.control.update(
-            error_x=dx,
-            error_y=dy,
-            valid=True,
-            control_enabled=self.control_started,
-            aligned=aligned,
-            state_name="TRACKING",
-        )
+        self.motor.drive(dx, dy, allow_drive=self.control_started and (not aligned))
         self._aligned_latched = aligned
 
         if DEBUG_MODE:
@@ -857,7 +814,7 @@ def main():
         time.sleep_ms(100)
         MediaManager.deinit()
         Sensor.deinit()
-        system.control.deinit()
+        system.motor.deinit()
         print("[System] stopped")
 
 

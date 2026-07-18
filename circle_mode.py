@@ -9,47 +9,22 @@ import time
 from machine import FPIOA, Pin
 
 try:
-    from control_backends import BACKEND_LOCAL
-    from control_backends import build_control_backend
-    from control_backends import mode_code_for_name
-    from control_backends import unit_code_for_name
-    from dual_core_config import CONTROL_BACKEND
-    from k230_common import load_calibration
+    from k230_common import build_stepper_controller, load_calibration
 except ImportError:
-    BACKEND_LOCAL = "local"
-    CONTROL_BACKEND = BACKEND_LOCAL
-
-    def build_control_backend(backend_name, axis_overrides=None, mode_code=0, unit_code=0):
-        class _NoopControlBackend:
+    def build_stepper_controller(axis_overrides=None):
+        class _NoopStepperController:
             ready = False
 
-            def update(
-                self,
-                error_x,
-                error_y,
-                valid,
-                control_enabled,
-                target_x=None,
-                target_y=None,
-                sync_ok=True,
-                aligned=False,
-                state_name="IDLE",
-            ):
+            def drive(self, error_x, error_y, allow_drive=True):
                 return
 
-            def stop(self, state_name="STOPPED"):
+            def stop(self):
                 return
 
             def deinit(self):
                 return
 
-        return _NoopControlBackend()
-
-    def mode_code_for_name(name):
-        return 0
-
-    def unit_code_for_name(name):
-        return 0
+        return _NoopStepperController()
 
     def load_calibration(default_red, default_black, default_violet, default_bright=None):
         return (
@@ -1461,12 +1436,7 @@ class CircleModeSystem:
     def __init__(self):
         self.detector = TargetDetector()
         self.tracker = CircleTracker()
-        self.control = build_control_backend(
-            CONTROL_BACKEND,
-            axis_overrides=STEPPER_AXIS_OVERRIDES,
-            mode_code=mode_code_for_name("circle"),
-            unit_code=unit_code_for_name("cm"),
-        )
+        self.motor = build_stepper_controller(STEPPER_AXIS_OVERRIDES)
         self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
         self.frame_count = 0
@@ -1548,14 +1518,14 @@ class CircleModeSystem:
         self._update_start_button()
 
         if self.state == "IDLE":
-            self.control.stop(state_name="IDLE")
+            self.motor.stop()
             if self.detector.target_found and self.detector.bullseye_found:
                 self.state = "WAITING"
                 self.start_align_frames = 0
                 self.tracker.reset()
                 print("[State] target ready -> WAITING")
         elif self.state == "WAITING":
-            self.control.stop(state_name="WAITING")
+            self.motor.stop()
             if self._check_start_alignment():
                 self.state = "RUNNING"
                 self.tracker.reset()
@@ -1569,7 +1539,7 @@ class CircleModeSystem:
                 self.start_align_frames = 0
                 self.last_sent_error = None
                 self.error_jump_count = 0
-                self.control.stop(state_name="STOPPED")
+                self.motor.stop()
             else:
                 self._handle_running()
 
@@ -1595,31 +1565,15 @@ class CircleModeSystem:
 
         if quality_ok:
             filtered_x, filtered_y, stable_ok = self._filter_error_jump(error_x, error_y)
-            self.control.update(
-                error_x=filtered_x,
-                error_y=filtered_y,
-                valid=True,
-                control_enabled=self.control_started,
-                target_x=target_dx,
-                target_y=target_dy,
-                sync_ok=sync_ok and stable_ok,
-                aligned=False,
-                state_name="RUNNING",
+            self.motor.drive(
+                filtered_x,
+                filtered_y,
+                allow_drive=self.control_started and sync_ok and stable_ok,
             )
         else:
             self.last_sent_error = None
             self.error_jump_count = 0
-            self.control.update(
-                error_x=None,
-                error_y=None,
-                valid=False,
-                control_enabled=self.control_started,
-                target_x=target_dx,
-                target_y=target_dy,
-                sync_ok=False,
-                aligned=False,
-                state_name="STOPPED",
-            )
+            self.motor.stop()
 
     def _draw_overlay(self, img):
         if self.detector.target_found and self.detector.target_rect:
@@ -1775,7 +1729,7 @@ def main():
         time.sleep_ms(100)
         MediaManager.deinit()
         Sensor.deinit()
-        system.control.deinit()
+        system.motor.deinit()
         print("system stopped")
 
 

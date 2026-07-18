@@ -9,47 +9,22 @@ import time
 from machine import FPIOA, Pin
 
 try:
-    from control_backends import BACKEND_LOCAL
-    from control_backends import build_control_backend
-    from control_backends import mode_code_for_name
-    from control_backends import unit_code_for_name
-    from dual_core_config import CONTROL_BACKEND
-    from k230_common import load_calibration
+    from k230_common import build_stepper_controller, load_calibration
 except ImportError:
-    BACKEND_LOCAL = "local"
-    CONTROL_BACKEND = BACKEND_LOCAL
-
-    def build_control_backend(backend_name, axis_overrides=None, mode_code=0, unit_code=0):
-        class _NoopControlBackend:
+    def build_stepper_controller(axis_overrides=None):
+        class _NoopStepperController:
             ready = False
 
-            def update(
-                self,
-                error_x,
-                error_y,
-                valid,
-                control_enabled,
-                target_x=None,
-                target_y=None,
-                sync_ok=True,
-                aligned=False,
-                state_name="IDLE",
-            ):
+            def drive(self, error_x, error_y, allow_drive=True):
                 return
 
-            def stop(self, state_name="STOPPED"):
+            def stop(self):
                 return
 
             def deinit(self):
                 return
 
-        return _NoopControlBackend()
-
-    def mode_code_for_name(name):
-        return 0
-
-    def unit_code_for_name(name):
-        return 0
+        return _NoopStepperController()
 
     def load_calibration(default_red, default_black, default_violet, default_bright=None):
         return (
@@ -1251,12 +1226,7 @@ class AimingSystem:
     def __init__(self):
         self.detector = TargetDetector()
         self.trajectory = CircleTrajectory(CIRCLE_RADIUS_CM)
-        self.control = build_control_backend(
-            CONTROL_BACKEND,
-            axis_overrides=STEPPER_AXIS_OVERRIDES,
-            mode_code=mode_code_for_name("aim"),
-            unit_code=unit_code_for_name("cm"),
-        )
+        self.motor = build_stepper_controller(STEPPER_AXIS_OVERRIDES)
         self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
         self.mode = "aim"
@@ -1282,44 +1252,22 @@ class AimingSystem:
 
         if self.mode == "aim":
             if offset_info is None:
-                self.control.update(
-                    error_x=None,
-                    error_y=None,
-                    valid=False,
-                    control_enabled=self.control_started,
-                    state_name="STOPPED",
-                )
+                self.motor.stop()
             else:
-                self.control.update(
-                    error_x=offset_info["dx_cm"],
-                    error_y=offset_info["dy_cm"],
-                    valid=True,
-                    control_enabled=self.control_started,
-                    aligned=False,
-                    state_name="TRACKING",
+                self.motor.drive(
+                    offset_info["dx_cm"],
+                    offset_info["dy_cm"],
+                    allow_drive=self.control_started,
                 )
         elif self.mode == "circle":
             target_dx, target_dy = self.trajectory.get_target_point()
             if offset_info is None:
-                self.control.update(
-                    error_x=None,
-                    error_y=None,
-                    valid=False,
-                    control_enabled=self.control_started,
-                    target_x=target_dx,
-                    target_y=target_dy,
-                    state_name="STOPPED",
-                )
+                self.motor.stop()
             else:
-                self.control.update(
-                    error_x=target_dx - offset_info["dx_cm"],
-                    error_y=target_dy - offset_info["dy_cm"],
-                    valid=True,
-                    control_enabled=self.control_started,
-                    target_x=target_dx,
-                    target_y=target_dy,
-                    aligned=False,
-                    state_name="RUNNING",
+                self.motor.drive(
+                    target_dx - offset_info["dx_cm"],
+                    target_dy - offset_info["dy_cm"],
+                    allow_drive=self.control_started,
                 )
 
         if DEBUG_MODE:
@@ -1400,7 +1348,7 @@ class AimingSystem:
             if mode == "circle":
                 self.trajectory.reset()
             if mode == "idle":
-                self.control.stop()
+                self.motor.stop()
             print(f"[Mode] {mode}")
 
 
@@ -1461,7 +1409,7 @@ def main():
         time.sleep_ms(100)
         MediaManager.deinit()
         Sensor.deinit()
-        aiming_system.control.deinit()
+        aiming_system.motor.deinit()
         print("[System] stopped")
 
 
