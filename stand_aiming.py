@@ -1,3 +1,4 @@
+import gc
 import math
 import os
 import sys
@@ -7,10 +8,17 @@ from common_hw import (DebouncedButton as StartButton, Display, draw_text,
                         camera_init, camera_start, camera_snapshot,
                         camera_restart, camera_deinit,
                         display_init)
-from mode_runtime import LoopStatsMixin, load_motion_support
-from vision_utils import RectTrackingMixin
 
-build_stepper_controller, _ = load_motion_support()
+try:
+    from k230_common import build_stepper_controller
+except ImportError:
+    def build_stepper_controller(axis_overrides=None):
+        class _NoopStepperController:
+            ready = False
+            def drive(self, *a, **kw): pass
+            def stop(self): pass
+            def deinit(self): pass
+        return _NoopStepperController()
 
 
 CAMERA_ID = 2
@@ -86,31 +94,7 @@ STEPPER_AXIS_OVERRIDES = {
 }
 
 
-class RectTracker(RectTrackingMixin):
-    frame_width = FRAME_WIDTH
-    frame_height = FRAME_HEIGHT
-    rect_binary_threshold = RECT_BINARY_THRESHOLD
-    target_aspect = TARGET_ASPECT
-    target_aspect_penalty_scale = TARGET_ASPECT_PENALTY_SCALE
-    target_min_w = TARGET_MIN_W
-    target_min_h = TARGET_MIN_H
-    target_min_area = TARGET_MIN_AREA
-    target_center_alpha = TARGET_CENTER_ALPHA
-    target_reset_dist_px = TARGET_RESET_DIST_PX
-    target_sticky_dist_px = TARGET_STICKY_DIST_PX
-    target_lead_gain = TARGET_LEAD_GAIN
-    target_lead_max_px = TARGET_LEAD_MAX_PX
-    target_max_jump_px = TARGET_MAX_JUMP_PX
-    target_max_size_change_ratio = TARGET_MAX_SIZE_CHANGE_RATIO
-    target_edge_margin_px = TARGET_EDGE_MARGIN_PX
-    target_edge_comp_min_ratio = TARGET_EDGE_COMP_MIN_RATIO
-    target_min_overlap_ratio = TARGET_MIN_OVERLAP_RATIO
-    target_init_center_bias = TARGET_INIT_CENTER_BIAS
-    target_near_center_px = TARGET_NEAR_CENTER_PX
-    target_border_sample_count = TARGET_BORDER_SAMPLE_COUNT
-    target_border_hit_ratio_min = TARGET_BORDER_HIT_RATIO_MIN
-    target_border_score_scale = TARGET_BORDER_SCORE_SCALE
-
+class RectTracker:
     def __init__(self):
         self.frame_id = 0
         self.target_rect = None
@@ -119,6 +103,250 @@ class RectTracker(RectTrackingMixin):
         self.target_miss_count = 0
         self.last_target_rect = None
         self.last_target_center = None
+
+    def _distance_sq(self, p0, p1):
+        dx = p0[0] - p1[0]
+        dy = p0[1] - p1[1]
+        return dx * dx + dy * dy
+
+    def _clamp_rect(self, x, y, w, h):
+        x = max(0, min(FRAME_WIDTH - 1, int(x)))
+        y = max(0, min(FRAME_HEIGHT - 1, int(y)))
+        w = max(1, min(FRAME_WIDTH - x, int(w)))
+        h = max(1, min(FRAME_HEIGHT - y, int(h)))
+        return (x, y, w, h)
+
+    def _clamp_point(self, point):
+        return (
+            max(0, min(FRAME_WIDTH - 1, int(point[0]))),
+            max(0, min(FRAME_HEIGHT - 1, int(point[1]))),
+        )
+
+    def _smooth_center(self, current, last_center, alpha, reset_px, sticky_px):
+        if last_center is None:
+            return current
+        dist_sq = self._distance_sq(current, last_center)
+        if dist_sq <= (sticky_px * sticky_px):
+            return last_center
+        if dist_sq > (reset_px * reset_px):
+            return current
+        return (
+            int(last_center[0] * (1 - alpha) + current[0] * alpha),
+            int(last_center[1] * (1 - alpha) + current[1] * alpha),
+        )
+
+    def _apply_motion_lead(self, current, last_center, gain, max_px):
+        if current is None or last_center is None or gain <= 0:
+            return current
+        dx = current[0] - last_center[0]
+        dy = current[1] - last_center[1]
+        lead_x = int(dx * gain)
+        lead_y = int(dy * gain)
+        if lead_x > max_px:
+            lead_x = max_px
+        elif lead_x < -max_px:
+            lead_x = -max_px
+        if lead_y > max_px:
+            lead_y = max_px
+        elif lead_y < -max_px:
+            lead_y = -max_px
+        return self._clamp_point((current[0] + lead_x, current[1] + lead_y))
+
+    def _rect_aspect_error(self, w, h):
+        aspect = w / max(h, 1)
+        target_inv = 1.0 / TARGET_ASPECT
+        return min(abs(aspect - TARGET_ASPECT), abs(aspect - target_inv))
+
+    def _rect_center_from_corners(self, corners):
+        sx = 0
+        sy = 0
+        points = []
+        for p in corners:
+            sx += p[0]
+            sy += p[1]
+            points.append((p[0], p[1]))
+        avg_center = (sx / 4, sy / 4)
+
+        points.sort(key=lambda p: math.atan2(p[1] - avg_center[1], p[0] - avg_center[0]))
+        p0 = points[0]
+        p1 = points[1]
+        p2 = points[2]
+        p3 = points[3]
+
+        x1 = p0[0]
+        y1 = p0[1]
+        x2 = p2[0]
+        y2 = p2[1]
+        x3 = p1[0]
+        y3 = p1[1]
+        x4 = p3[0]
+        y4 = p3[1]
+
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denom) < 1:
+            return self._clamp_point(avg_center)
+
+        det1 = x1 * y2 - y1 * x2
+        det2 = x3 * y4 - y3 * x4
+        center_x = (det1 * (x3 - x4) - (x1 - x2) * det2) / denom
+        center_y = (det1 * (y3 - y4) - (y1 - y2) * det2) / denom
+        if center_x < -8 or center_x > (FRAME_WIDTH + 8) or center_y < -8 or center_y > (FRAME_HEIGHT + 8):
+            return self._clamp_point(avg_center)
+        return self._clamp_point((center_x, center_y))
+
+    def _rect_size_change_ok(self, rect, last_rect):
+        if last_rect is None:
+            return True
+        _, _, w, h = rect
+        _, _, last_w, last_h = last_rect
+        if last_w <= 0 or last_h <= 0:
+            return True
+        dw = abs(w - last_w) / last_w
+        dh = abs(h - last_h) / last_h
+        return dw <= TARGET_MAX_SIZE_CHANGE_RATIO and dh <= TARGET_MAX_SIZE_CHANGE_RATIO
+
+    def _compensate_edge_rect(self, rect, last_rect):
+        if last_rect is None:
+            return rect
+        x, y, w, h = rect
+        _, _, last_w, last_h = last_rect
+        if last_w <= 0 or last_h <= 0:
+            return rect
+
+        x2 = x + w
+        y2 = y + h
+        if x <= TARGET_EDGE_MARGIN_PX and w < int(last_w * TARGET_EDGE_COMP_MIN_RATIO):
+            w = last_w
+        elif x2 >= (FRAME_WIDTH - TARGET_EDGE_MARGIN_PX) and w < int(last_w * TARGET_EDGE_COMP_MIN_RATIO):
+            x = max(0, x2 - last_w)
+            w = FRAME_WIDTH - x if x + last_w > FRAME_WIDTH else last_w
+
+        if y <= TARGET_EDGE_MARGIN_PX and h < int(last_h * TARGET_EDGE_COMP_MIN_RATIO):
+            h = last_h
+        elif y2 >= (FRAME_HEIGHT - TARGET_EDGE_MARGIN_PX) and h < int(last_h * TARGET_EDGE_COMP_MIN_RATIO):
+            y = max(0, y2 - last_h)
+            h = FRAME_HEIGHT - y if y + last_h > FRAME_HEIGHT else last_h
+
+        return self._clamp_rect(x, y, w, h)
+
+    def _rect_overlap_ratio(self, rect_a, rect_b):
+        if rect_a is None or rect_b is None:
+            return 0.0
+        ax, ay, aw, ah = rect_a
+        bx, by, bw, bh = rect_b
+        ax2 = ax + aw
+        ay2 = ay + ah
+        bx2 = bx + bw
+        by2 = by + bh
+        ix1 = max(ax, bx)
+        iy1 = max(ay, by)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        iw = ix2 - ix1
+        ih = iy2 - iy1
+        if iw <= 0 or ih <= 0:
+            return 0.0
+        inter = iw * ih
+        min_area = min(max(1, aw * ah), max(1, bw * bh))
+        return inter / min_area
+
+    def _rect_border_hit_ratio(self, rect_img, rect):
+        x, y, w, h = rect
+        if w <= 4 or h <= 4:
+            return 0.0
+        inset = max(1, min(6, min(w, h) // 12))
+        x1 = x + inset
+        y1 = y + inset
+        x2 = x + w - 1 - inset
+        y2 = y + h - 1 - inset
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        hits = 0
+        total = 0
+        steps = max(4, TARGET_BORDER_SAMPLE_COUNT)
+        for idx in range(steps):
+            t = idx / max(1, steps - 1)
+            sx = int(x1 + (x2 - x1) * t)
+            sy = int(y1 + (y2 - y1) * t)
+            points = ((sx, y1), (sx, y2), (x1, sy), (x2, sy))
+            for px, py in points:
+                total += 1
+                try:
+                    if rect_img.get_pixel(px, py):
+                        hits += 1
+                except Exception:
+                    pass
+        if total <= 0:
+            return 0.0
+        return hits / total
+
+    def _accept_center(self, candidate_center, last_center):
+        if candidate_center is None or last_center is None:
+            return True
+        return self._distance_sq(candidate_center, last_center) <= (TARGET_MAX_JUMP_PX * TARGET_MAX_JUMP_PX)
+
+    def _prepare_rect_image(self, img):
+        rect_img = img.to_grayscale()
+        rect_img.binary([RECT_BINARY_THRESHOLD])
+        return rect_img
+
+    def _select_best_rect(self, rect_img, rects, reference_center, reference_rect):
+        best = None
+        best_score = None
+        image_center = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
+
+        for r in rects:
+            raw_rect = r.rect()
+            corners = r.corners()
+            if raw_rect is None or corners is None or len(corners) != 4:
+                continue
+
+            rect = self._compensate_edge_rect(raw_rect, reference_rect)
+            x, y, w, h = rect
+            if w < TARGET_MIN_W or h < TARGET_MIN_H:
+                continue
+            area = w * h
+            if area < TARGET_MIN_AREA:
+                continue
+            if not self._rect_size_change_ok(rect, reference_rect):
+                continue
+
+            center = self._rect_center_from_corners(corners)
+            border_hit_ratio = self._rect_border_hit_ratio(rect_img, rect)
+            if border_hit_ratio < TARGET_BORDER_HIT_RATIO_MIN:
+                continue
+            if reference_center is not None:
+                jump_sq = self._distance_sq(center, reference_center)
+                if jump_sq > (TARGET_RESET_DIST_PX * TARGET_RESET_DIST_PX):
+                    continue
+            if reference_rect is not None:
+                overlap_ratio = self._rect_overlap_ratio(rect, reference_rect)
+                if overlap_ratio < TARGET_MIN_OVERLAP_RATIO and (
+                    reference_center is None
+                    or self._distance_sq(center, reference_center) > (TARGET_STICKY_DIST_PX * TARGET_STICKY_DIST_PX)
+                ):
+                    continue
+
+            aspect_penalty = int(self._rect_aspect_error(w, h) * TARGET_ASPECT_PENALTY_SCALE)
+            if reference_center is not None:
+                distance_penalty = self._distance_sq(center, reference_center) // 10
+            else:
+                distance_penalty = self._distance_sq(center, image_center) // TARGET_INIT_CENTER_BIAS
+            edge_penalty = 0
+            if x <= 2 or y <= 2 or (x + w) >= (FRAME_WIDTH - 2) or (y + h) >= (FRAME_HEIGHT - 2):
+                edge_penalty = 3600
+            center_bias_bonus = 0
+            if self._distance_sq(center, image_center) <= (TARGET_NEAR_CENTER_PX * TARGET_NEAR_CENTER_PX):
+                center_bias_bonus = 2000
+            border_score_bonus = int(border_hit_ratio * TARGET_BORDER_SCORE_SCALE)
+
+            score = area - aspect_penalty - distance_penalty - edge_penalty + center_bias_bonus + border_score_bonus
+            if best_score is None or score > best_score:
+                best_score = score
+                best = (rect, center)
+
+        return best
 
     def detect(self, img):
         self.frame_id += 1
@@ -135,7 +363,7 @@ class RectTracker(RectTrackingMixin):
         rects = rect_img.find_rects(threshold=RECT_THRESHOLD) or []
         chosen = self._select_best_rect(rect_img, rects, previous_center, previous_rect)
         if chosen is not None:
-            _, _, center = chosen
+            _, center = chosen
             if not self._accept_center(center, previous_center):
                 chosen = None
 
@@ -151,7 +379,7 @@ class RectTracker(RectTrackingMixin):
             return self.target_found, self.target_rect, self.target_center
 
         self.target_miss_count = 0
-        rect, _, center = chosen
+        rect, center = chosen
         self.target_rect = rect
         self.target_center = self._smooth_center(
             center,
@@ -172,13 +400,16 @@ class RectTracker(RectTrackingMixin):
         return self.target_found, self.target_rect, self.target_center
 
 
-class RectCenterSystem(LoopStatsMixin):
+class RectCenterSystem:
     def __init__(self):
         self.tracker = RectTracker()
         self.motor = build_stepper_controller(STEPPER_AXIS_OVERRIDES)
         self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
-        self._init_loop_stats(enable_fps=True)
+        self.frame_count = 0
+        self.fps = 0.0
+        self.last_fps_time = time.ticks_ms()
+        self.gc_counter = 0
         self.last_aligned = False
         self._aligned_latched = False
 
@@ -190,7 +421,8 @@ class RectCenterSystem(LoopStatsMixin):
             print("[Motor] start button pressed, stepper control enabled")
 
     def process_frame(self, img):
-        self._mark_frame()
+        self.frame_count += 1
+        self.gc_counter += 1
         self._update_start_button()
 
         found, rect, center = self.tracker.detect(img)
@@ -242,6 +474,20 @@ class RectCenterSystem(LoopStatsMixin):
         if not self.control_started:
             draw_text(img, 4, FRAME_HEIGHT - 18, "PRESS GPIO28 TO START MOTOR", color=(255, 255, 0), scale=1)
 
+    def update_fps(self):
+        current_time = time.ticks_ms()
+        dt = time.ticks_diff(current_time, self.last_fps_time)
+        if dt >= 1000:
+            self.fps = self.frame_count * 1000 / dt
+            self.frame_count = 0
+            self.last_fps_time = current_time
+
+    def maybe_collect_gc(self):
+        if self.gc_counter >= GC_INTERVAL:
+            gc.collect()
+            self.gc_counter = 0
+
+
 def main():
     print("=" * 50)
     print("K230 Rect Center Mode")
@@ -284,7 +530,7 @@ def main():
             img = system.process_frame(img)
             system.update_fps()
             Display.show_image(img)
-            system.maybe_collect_gc(GC_INTERVAL)
+            system.maybe_collect_gc()
             time.sleep_ms(FRAME_LOOP_DELAY_MS)
     except KeyboardInterrupt:
         print("\n[System] interrupted")

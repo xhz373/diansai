@@ -1,3 +1,4 @@
+import gc
 import math
 import os
 import sys
@@ -7,10 +8,33 @@ from common_hw import (DebouncedButton as StartButton, Display, draw_text,
                         camera_init, camera_start, camera_snapshot,
                         camera_restart, camera_deinit,
                         display_init)
-from mode_runtime import LoopStatsMixin, apply_saved_thresholds, load_motion_support
-from vision_utils import HomographyMixin, RectTrackingMixin
 
-build_stepper_controller, load_calibration = load_motion_support()
+try:
+    from k230_common import build_stepper_controller, load_calibration
+except ImportError:
+    def build_stepper_controller(axis_overrides=None):
+        class _NoopStepperController:
+            ready = False
+
+            def drive(self, error_x, error_y, allow_drive=True):
+                return
+
+            def stop(self):
+                return
+
+            def deinit(self):
+                return
+
+        return _NoopStepperController()
+
+    def load_calibration(default_red, default_black, default_violet, default_bright=None):
+        return (
+            False,
+            tuple(default_red),
+            tuple(default_black),
+            tuple(default_violet),
+            default_bright,
+        )
 
 
 CAMERA_ID = 2
@@ -120,15 +144,16 @@ STEPPER_AXIS_OVERRIDES = {
 
 def apply_calibration():
     global RED_THRESHOLD, BLACK_THRESHOLD, VIOLET_THRESHOLD
-    ok, red, black, violet, _ = apply_saved_thresholds(
-        load_calibration,
-        RED_THRESHOLD,
-        BLACK_THRESHOLD,
-        VIOLET_THRESHOLD,
+    ok, red, black, violet, _ = load_calibration(
+        RED_THRESHOLD, BLACK_THRESHOLD, VIOLET_THRESHOLD
     )
     RED_THRESHOLD = red
     BLACK_THRESHOLD = black
     VIOLET_THRESHOLD = violet
+    if ok:
+        print("[Calib] thresholds applied")
+    else:
+        print("[Calib] using built-in thresholds")
 
 
 class CircleTracker:
@@ -181,33 +206,7 @@ class CircleTracker:
         self.lap_count = 0
 
 
-class TargetDetector(RectTrackingMixin, HomographyMixin):
-    frame_width = FRAME_WIDTH
-    frame_height = FRAME_HEIGHT
-    rect_binary_threshold = RECT_BINARY_THRESHOLD
-    target_width_cm = TARGET_WIDTH_CM
-    target_height_cm = TARGET_HEIGHT_CM
-    target_aspect = TARGET_ASPECT
-    target_aspect_penalty_scale = TARGET_ASPECT_PENALTY_SCALE
-    target_min_w = TARGET_MIN_W
-    target_min_h = TARGET_MIN_H
-    target_min_area = TARGET_MIN_AREA
-    target_center_alpha = TARGET_CENTER_ALPHA
-    target_reset_dist_px = TARGET_RESET_DIST_PX
-    target_sticky_dist_px = TARGET_STICKY_DIST_PX
-    target_lead_gain = TARGET_LEAD_GAIN
-    target_lead_max_px = TARGET_LEAD_MAX_PX
-    target_max_jump_px = TARGET_MAX_JUMP_PX
-    target_max_size_change_ratio = TARGET_MAX_SIZE_CHANGE_RATIO
-    target_edge_margin_px = TARGET_EDGE_MARGIN_PX
-    target_edge_comp_min_ratio = TARGET_EDGE_COMP_MIN_RATIO
-    target_min_overlap_ratio = TARGET_MIN_OVERLAP_RATIO
-    target_init_center_bias = TARGET_INIT_CENTER_BIAS
-    target_near_center_px = TARGET_NEAR_CENTER_PX
-    target_border_sample_count = TARGET_BORDER_SAMPLE_COUNT
-    target_border_hit_ratio_min = TARGET_BORDER_HIT_RATIO_MIN
-    target_border_score_scale = TARGET_BORDER_SCORE_SCALE
-
+class TargetDetector:
     def __init__(self):
         self.target_rect = None
         self.target_center = None
@@ -278,6 +277,180 @@ class TargetDetector(RectTrackingMixin, HomographyMixin):
                 self.bullseye_found = False
                 self.laser_found = False
                 self.detected_ring_radius_cm = CIRCLE_RADIUS_CM
+
+    def _clamp_rect(self, x, y, w, h):
+        x = max(0, min(FRAME_WIDTH - 1, int(x)))
+        y = max(0, min(FRAME_HEIGHT - 1, int(y)))
+        w = max(1, min(FRAME_WIDTH - x, int(w)))
+        h = max(1, min(FRAME_HEIGHT - y, int(h)))
+        return (x, y, w, h)
+
+    def _distance_sq(self, p0, p1):
+        dx = p0[0] - p1[0]
+        dy = p0[1] - p1[1]
+        return dx * dx + dy * dy
+
+    def _smooth_center(self, current, last_center, alpha, reset_px, sticky_px):
+        if last_center is None:
+            return current
+        dist_sq = self._distance_sq(current, last_center)
+        if dist_sq <= (sticky_px * sticky_px):
+            return last_center
+        if dist_sq > (reset_px * reset_px):
+            return current
+        return (
+            int(last_center[0] * (1 - alpha) + current[0] * alpha),
+            int(last_center[1] * (1 - alpha) + current[1] * alpha),
+        )
+
+    def _smooth_scalar(self, current, last_value, alpha):
+        if last_value <= 0:
+            return current
+        return last_value * (1 - alpha) + current * alpha
+
+    def _apply_motion_lead(self, current, last_center, gain, max_px):
+        if current is None or last_center is None or gain <= 0:
+            return current
+        dx = current[0] - last_center[0]
+        dy = current[1] - last_center[1]
+        lead_x = int(dx * gain)
+        lead_y = int(dy * gain)
+        if lead_x > max_px:
+            lead_x = max_px
+        elif lead_x < -max_px:
+            lead_x = -max_px
+        if lead_y > max_px:
+            lead_y = max_px
+        elif lead_y < -max_px:
+            lead_y = -max_px
+        return self._clamp_point((current[0] + lead_x, current[1] + lead_y))
+
+    def _solve_linear_system(self, matrix, values):
+        size = len(values)
+        a = []
+        for row in range(size):
+            current = []
+            for col in range(size):
+                current.append(float(matrix[row][col]))
+            current.append(float(values[row]))
+            a.append(current)
+
+        for col in range(size):
+            pivot = col
+            pivot_abs = abs(a[pivot][col])
+            for row in range(col + 1, size):
+                value_abs = abs(a[row][col])
+                if value_abs > pivot_abs:
+                    pivot = row
+                    pivot_abs = value_abs
+            if pivot_abs < 1e-6:
+                return None
+            if pivot != col:
+                tmp = a[col]
+                a[col] = a[pivot]
+                a[pivot] = tmp
+
+            pivot_value = a[col][col]
+            for idx in range(col, size + 1):
+                a[col][idx] /= pivot_value
+
+            for row in range(size):
+                if row == col:
+                    continue
+                factor = a[row][col]
+                for idx in range(col, size + 1):
+                    a[row][idx] -= factor * a[col][idx]
+
+        result = []
+        for row in range(size):
+            result.append(a[row][size])
+        return tuple(result)
+
+    def _compute_homography(self, src_points, dst_points):
+        matrix = []
+        values = []
+        for idx in range(4):
+            x = float(src_points[idx][0])
+            y = float(src_points[idx][1])
+            u = float(dst_points[idx][0])
+            v = float(dst_points[idx][1])
+            matrix.append([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y])
+            values.append(u)
+            matrix.append([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y])
+            values.append(v)
+
+        solution = self._solve_linear_system(matrix, values)
+        if solution is None:
+            return None
+        return (
+            (solution[0], solution[1], solution[2]),
+            (solution[3], solution[4], solution[5]),
+            (solution[6], solution[7], 1.0),
+        )
+
+    def _apply_homography(self, h, x, y):
+        if h is None:
+            return None
+        denom = h[2][0] * x + h[2][1] * y + h[2][2]
+        if abs(denom) < 1e-6:
+            return None
+        out_x = (h[0][0] * x + h[0][1] * y + h[0][2]) / denom
+        out_y = (h[1][0] * x + h[1][1] * y + h[1][2]) / denom
+        return (out_x, out_y)
+
+    def _normalize_corners(self, corners):
+        sx = 0
+        sy = 0
+        points = []
+        for p in corners:
+            sx += p[0]
+            sy += p[1]
+            points.append((float(p[0]), float(p[1])))
+        center = (sx / 4, sy / 4)
+        points.sort(key=lambda p: math.atan2(p[1] - center[1], p[0] - center[0]))
+
+        top_left_idx = 0
+        best_score = points[0][0] + points[0][1]
+        for idx in range(1, 4):
+            score = points[idx][0] + points[idx][1]
+            if score < best_score:
+                best_score = score
+                top_left_idx = idx
+
+        ordered = []
+        for idx in range(4):
+            ordered.append(points[(top_left_idx + idx) % 4])
+        return ordered
+
+    def _plane_size_cm_for_corners(self, corners):
+        top = math.sqrt((corners[1][0] - corners[0][0]) ** 2 + (corners[1][1] - corners[0][1]) ** 2)
+        right = math.sqrt((corners[2][0] - corners[1][0]) ** 2 + (corners[2][1] - corners[1][1]) ** 2)
+        bottom = math.sqrt((corners[2][0] - corners[3][0]) ** 2 + (corners[2][1] - corners[3][1]) ** 2)
+        left = math.sqrt((corners[3][0] - corners[0][0]) ** 2 + (corners[3][1] - corners[0][1]) ** 2)
+        width_px = (top + bottom) * 0.5
+        height_px = (left + right) * 0.5
+        aspect = width_px / max(height_px, 1e-6)
+        normal_error = abs(aspect - TARGET_ASPECT)
+        swapped_error = abs(aspect - (1.0 / TARGET_ASPECT))
+        if swapped_error < normal_error:
+            return TARGET_HEIGHT_CM, TARGET_WIDTH_CM
+        return TARGET_WIDTH_CM, TARGET_HEIGHT_CM
+
+    def target_plane_cm_to_image(self, dx_cm, dy_cm):
+        if self.target_to_image_h is None:
+            return None
+        projected = self._apply_homography(self.target_to_image_h, dx_cm, dy_cm)
+        if projected is None:
+            return None
+        return self._clamp_point(projected)
+
+    def _point_to_target_plane_cm(self, point):
+        if self.image_to_target_h is None:
+            return None
+        projected = self._apply_homography(self.image_to_target_h, point[0], point[1])
+        if projected is None:
+            return None
+        return projected
 
     def target_offset_cm_to_image_point(self, dx_cm, dy_cm):
         if self.bullseye_plane_cm is None:
@@ -972,14 +1145,15 @@ class TargetDetector(RectTrackingMixin, HomographyMixin):
         return target_dx_cm - laser_dx, target_dy_cm - laser_dy
 
 
-class CircleModeSystem(LoopStatsMixin):
+class CircleModeSystem:
     def __init__(self):
         self.detector = TargetDetector()
         self.tracker = CircleTracker()
         self.motor = build_stepper_controller(STEPPER_AXIS_OVERRIDES)
         self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
-        self._init_loop_stats(enable_fps=False)
+        self.frame_count = 0
+        self.gc_counter = 0
         self.state = "IDLE"
         self.start_align_frames = 0
         self.last_sent_error = None
@@ -1051,7 +1225,8 @@ class CircleModeSystem(LoopStatsMixin):
             print("[Motor] start button pressed, stepper control enabled")
 
     def process_frame(self, img):
-        self._mark_frame()
+        self.frame_count += 1
+        self.gc_counter += 1
         self.detector.detect_all(img)
         self._update_start_button()
 
@@ -1253,7 +1428,9 @@ def main():
             Display.show_image(img)
             time.sleep_ms(FRAME_LOOP_DELAY_MS)
 
-            system.maybe_collect_gc(GC_FRAME_INTERVAL)
+            if system.gc_counter >= GC_FRAME_INTERVAL:
+                gc.collect()
+                system.gc_counter = 0
     except KeyboardInterrupt:
         print("\nuser interrupted")
     except Exception as e:
