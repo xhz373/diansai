@@ -7,6 +7,11 @@ CALIB_FILE = "/sdcard/app/aiming_calib.json"
 
 # Default two-axis stepper wiring. Adjust these board pins to match your driver.
 # Each axis assumes a STEP/DIR/EN driver such as A4988/DRV8825/TB6600.
+# STEP pins are chosen from different PWM frequency groups so X/Y can run at
+# different step rates:
+# - Group A (PWM0/1/2): GPIO42, GPIO43, GPIO46
+# - Group B (PWM3/4/5): GPIO47, GPIO52, GPIO53
+# This layout avoids the already-used GPIO20/28/29/30/31 pins.
 DEFAULT_STEPPER_AXES = {
     "x": {
         "name": "X",
@@ -34,11 +39,11 @@ DEFAULT_STEPPER_AXES = {
     },
     "y": {
         "name": "Y",
-        "step_board_pin": 8,
-        "dir_board_pin": 7,
-        "dir_gpio_num": 7,
-        "enable_board_pin": 6,
-        "enable_gpio_num": 6,
+        "step_board_pin": 47,
+        "dir_board_pin": 45,
+        "dir_gpio_num": 45,
+        "enable_board_pin": 46,
+        "enable_gpio_num": 46,
         "command_sign": 1,
         "dir_invert": False,
         "enable_active_low": True,
