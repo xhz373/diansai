@@ -1,39 +1,17 @@
-from media.sensor import *
-from media.display import *
-from media.media import *
 import gc
 import math
 import os
 import sys
 import time
-from machine import FPIOA, Pin
 
-try:
-    from k230_common import build_stepper_controller, load_calibration
-except ImportError:
-    def build_stepper_controller(axis_overrides=None):
-        class _NoopStepperController:
-            ready = False
+from common_hw import (DebouncedButton as StartButton, Display, draw_text,
+                        camera_init, camera_start, camera_snapshot,
+                        camera_restart, camera_deinit,
+                        display_init)
+from mode_runtime import LoopStatsMixin, apply_saved_thresholds, load_motion_support
+from vision_utils import HomographyMixin, RectTrackingMixin
 
-            def drive(self, error_x, error_y, allow_drive=True):
-                return
-
-            def stop(self):
-                return
-
-            def deinit(self):
-                return
-
-        return _NoopStepperController()
-
-    def load_calibration(default_red, default_black, default_violet, default_bright=None):
-        return (
-            False,
-            tuple(default_red),
-            tuple(default_black),
-            tuple(default_violet),
-            default_bright,
-        )
+build_stepper_controller, load_calibration = load_motion_support()
 
 
 CAMERA_ID = 2
@@ -85,19 +63,9 @@ BULLSEYE_LEAD_MAX_PX = 10
 
 START_BUTTON_BOARD_PIN = 28
 START_BUTTON_GPIO_NUM = 28
-BUTTON_DEBOUNCE_MS = 35
 DEBUG_MODE = True
 DEBUG_TEXT_OVERLAY = False
-DISPLAY_FPS = 30
 FRAME_LOOP_DELAY_MS = 0
-SNAPSHOT_RETRY_COUNT = 3
-SNAPSHOT_RETRY_DELAY_MS = 3
-SENSOR_WARMUP_FRAMES = 2
-START_CAMERA_RETRY_COUNT = 2
-START_CAMERA_RETRY_DELAY_MS = 10
-START_CAMERA_SETTLE_MS = 28
-START_CAMERA_SETTLE_STEP_MS = 18
-ALLOW_CHANNEL_FALLBACK = False
 MAX_CONSECUTIVE_SNAPSHOT_FAILURES = 5
 TARGET_MAX_MISS_FRAMES = 6
 LASER_MAX_MISS_FRAMES = 2
@@ -109,7 +77,6 @@ TARGET_POINT_HISTORY_LEN = 3
 LASER_POINT_HISTORY_LEN = 1
 RADIUS_HISTORY_LEN = 3
 BUILD_TAG = "2026-07-14-aim-fastboot-v19"
-CURRENT_SNAPSHOT_CHN = CAM_CHN_ID_1
 
 STEPPER_AXIS_OVERRIDES = {
     "x": {
@@ -137,272 +104,44 @@ STEPPER_AXIS_OVERRIDES = {
 
 def apply_calibration():
     global RED_THRESHOLD, BLACK_THRESHOLD, VIOLET_THRESHOLD
-    ok, red, black, violet, _ = load_calibration(
-        RED_THRESHOLD, BLACK_THRESHOLD, VIOLET_THRESHOLD
+    ok, red, black, violet, _ = apply_saved_thresholds(
+        load_calibration,
+        RED_THRESHOLD,
+        BLACK_THRESHOLD,
+        VIOLET_THRESHOLD,
     )
     RED_THRESHOLD = red
     BLACK_THRESHOLD = black
     VIOLET_THRESHOLD = violet
-    if ok:
-        print("[Calib] thresholds applied")
-    else:
-        print("[Calib] using built-in thresholds")
 
 
-def _snapshot_channel_name(snapshot_chn):
-    if snapshot_chn == CAM_CHN_ID_1:
-        return "chn1"
-    return "chn0"
+class TargetDetector(RectTrackingMixin, HomographyMixin):
+    frame_width = FRAME_WIDTH
+    frame_height = FRAME_HEIGHT
+    rect_binary_threshold = RECT_BINARY_THRESHOLD
+    target_width_cm = TARGET_WIDTH_CM
+    target_height_cm = TARGET_HEIGHT_CM
+    target_aspect = TARGET_ASPECT
+    target_aspect_penalty_scale = TARGET_ASPECT_PENALTY_SCALE
+    target_min_w = TARGET_MIN_W
+    target_min_h = TARGET_MIN_H
+    target_min_area = TARGET_MIN_AREA
+    target_center_alpha = TARGET_CENTER_ALPHA
+    target_reset_dist_px = TARGET_RESET_DIST_PX
+    target_sticky_dist_px = TARGET_STICKY_DIST_PX
+    target_lead_gain = TARGET_LEAD_GAIN
+    target_lead_max_px = TARGET_LEAD_MAX_PX
+    target_max_jump_px = TARGET_MAX_JUMP_PX
+    target_max_size_change_ratio = TARGET_MAX_SIZE_CHANGE_RATIO
+    target_edge_margin_px = TARGET_EDGE_MARGIN_PX
+    target_edge_comp_min_ratio = TARGET_EDGE_COMP_MIN_RATIO
+    target_min_overlap_ratio = TARGET_MIN_OVERLAP_RATIO
+    target_init_center_bias = TARGET_INIT_CENTER_BIAS
+    target_near_center_px = TARGET_NEAR_CENTER_PX
+    target_border_sample_count = TARGET_BORDER_SAMPLE_COUNT
+    target_border_hit_ratio_min = TARGET_BORDER_HIT_RATIO_MIN
+    target_border_score_scale = TARGET_BORDER_SCORE_SCALE
 
-
-def _configure_sensor_for_channel(sensor, camera_id, snapshot_chn):
-    sensor.reset()
-    try:
-        sensor.set_hmirror(SENSOR_HMIRROR)
-    except Exception:
-        pass
-    try:
-        sensor.set_vflip(SENSOR_VFLIP)
-    except Exception:
-        pass
-    if snapshot_chn == CAM_CHN_ID_1:
-        sensor.set_framesize(Sensor.FHD)
-        sensor.set_pixformat(Sensor.YUV420SP)
-        sensor.set_framesize(width=FRAME_WIDTH, height=FRAME_HEIGHT, chn=CAM_CHN_ID_1)
-        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
-    else:
-        sensor.set_framesize(width=FRAME_WIDTH, height=FRAME_HEIGHT)
-        sensor.set_pixformat(Sensor.RGB565)
-
-
-def _snapshot_once(sensor, snapshot_chn):
-    if snapshot_chn == CAM_CHN_ID_1:
-        return sensor.snapshot(chn=CAM_CHN_ID_1)
-    return sensor.snapshot(chn=CAM_CHN_ID_0)
-
-
-def init_camera_sensor(camera_id=None):
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    try:
-        sensor = Sensor(id=camera_id)
-    except OSError as e:
-        if "already inited" not in str(e):
-            raise
-        Sensor.deinit()
-        time.sleep_ms(20)
-        sensor = Sensor(id=camera_id)
-    return sensor
-
-
-def _start_camera_on_channel(sensor, camera_id, snapshot_chn):
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    last_error = None
-    for attempt in range(START_CAMERA_RETRY_COUNT):
-        os.exitpoint()
-        try:
-            MediaManager.init()
-            sensor.run()
-            settle_ms = START_CAMERA_SETTLE_MS + attempt * START_CAMERA_SETTLE_STEP_MS
-            time.sleep_ms(settle_ms)
-            for _ in range(SENSOR_WARMUP_FRAMES):
-                os.exitpoint()
-                try:
-                    _snapshot_once(sensor, snapshot_chn)
-                    return True
-                except Exception as e:
-                    last_error = e
-                    time.sleep_ms(SNAPSHOT_RETRY_DELAY_MS)
-            last_error = RuntimeError(
-                "camera id {} no warmup frames on {}".format(
-                    camera_id, _snapshot_channel_name(snapshot_chn)
-                )
-            )
-        except Exception as e:
-            last_error = e
-
-        try:
-            sensor.stop()
-        except Exception:
-            pass
-        try:
-            MediaManager.deinit()
-        except Exception:
-            pass
-        try:
-            _configure_sensor_for_channel(sensor, camera_id, snapshot_chn)
-        except Exception:
-            pass
-        gc.collect()
-        time.sleep_ms(START_CAMERA_RETRY_DELAY_MS)
-
-    raise last_error
-
-
-def start_camera(sensor, camera_id=None):
-    global CURRENT_SNAPSHOT_CHN
-    if camera_id is None:
-        camera_id = CAMERA_ID
-    last_error = None
-    channels = (CAM_CHN_ID_1,)
-    if ALLOW_CHANNEL_FALLBACK:
-        channels = (CAM_CHN_ID_1, CAM_CHN_ID_0)
-    for snapshot_chn in channels:
-        os.exitpoint()
-        try:
-            _configure_sensor_for_channel(sensor, camera_id, snapshot_chn)
-            _start_camera_on_channel(sensor, camera_id, snapshot_chn)
-            CURRENT_SNAPSHOT_CHN = snapshot_chn
-            return True
-        except Exception as e:
-            last_error = e
-            try:
-                sensor.stop()
-            except Exception:
-                pass
-            try:
-                MediaManager.deinit()
-            except Exception:
-                pass
-            gc.collect()
-            time.sleep_ms(START_CAMERA_RETRY_DELAY_MS)
-    raise last_error
-
-
-def snapshot_with_retry(sensor):
-    last_error = None
-    for _ in range(SNAPSHOT_RETRY_COUNT):
-        os.exitpoint()
-        try:
-            return _snapshot_once(sensor, CURRENT_SNAPSHOT_CHN)
-        except RuntimeError as e:
-            last_error = e
-            time.sleep_ms(SNAPSHOT_RETRY_DELAY_MS)
-    raise last_error
-
-
-def draw_text(img, x, y, text, color=(255, 255, 255), scale=1):
-    text = str(text)
-    if hasattr(img, "draw_string_advanced"):
-        img.draw_string_advanced(x, y, max(16, 16 * scale), text, color=color)
-    else:
-        img.draw_string(x, y, text, color=color, scale=scale)
-
-
-def _pin_pull_up_value():
-    for name in ("PULL_UP", "PULLUP", "PULL_UP_ENABLE"):
-        value = getattr(Pin, name, None)
-        if value is not None:
-            return value
-    return None
-
-
-def _map_board_pin_to_gpio(fpioa, board_pin, gpio_num):
-    if not hasattr(fpioa, "set_function"):
-        return
-    for func_name in (
-        "GPIO{}_FUNC".format(gpio_num),
-        "GPIO{}".format(gpio_num),
-        "GPIOHS{}".format(gpio_num),
-        "GPIOHS{}_FUNC".format(gpio_num),
-    ):
-        func = getattr(fpioa, func_name, None)
-        if func is not None:
-            fpioa.set_function(board_pin, func)
-            return
-
-
-class StartButton:
-    def __init__(self, board_pin, gpio_num):
-        self.pin = None
-        self.ready = False
-        self.latched = False
-        self.last_raw_value = 1
-        self.stable_value = 1
-        self.last_change_ms = 0
-        self._init_pin(board_pin, gpio_num)
-
-    def _init_pin(self, board_pin, gpio_num):
-        try:
-            fpioa = FPIOA()
-            _map_board_pin_to_gpio(fpioa, board_pin, gpio_num)
-            pull_up = _pin_pull_up_value()
-            if pull_up is None:
-                try:
-                    self.pin = Pin(gpio_num, Pin.IN)
-                except Exception:
-                    self.pin = Pin(board_pin, Pin.IN)
-            else:
-                try:
-                    self.pin = Pin(gpio_num, Pin.IN, pull_up)
-                except Exception:
-                    self.pin = Pin(board_pin, Pin.IN, pull_up)
-            self.ready = self.pin is not None
-        except Exception as e:
-            print("[Key] start init failed:", e)
-            self.pin = None
-            self.ready = False
-
-    def poll_pressed(self):
-        if self.latched or self.pin is None:
-            return self.latched
-        now = time.ticks_ms()
-        try:
-            raw_value = self.pin.value()
-        except Exception:
-            return False
-        if raw_value != self.last_raw_value:
-            self.last_raw_value = raw_value
-            self.last_change_ms = now
-            return False
-        if time.ticks_diff(now, self.last_change_ms) < BUTTON_DEBOUNCE_MS:
-            return False
-        if raw_value != self.stable_value:
-            self.stable_value = raw_value
-            if self.stable_value == 0:
-                self.latched = True
-                return True
-        return False
-
-
-def init_preview_display():
-    try:
-        Display.init(
-            Display.VIRT, width=FRAME_WIDTH, height=FRAME_HEIGHT, fps=100, to_ide=True
-        )
-        print("[Display] VIRT preview")
-    except Exception as e:
-        print(f"[Display] VIRT failed: {e}")
-        Display.init(Display.ST7701, to_ide=True)
-        print("[Display] ST7701 preview")
-
-
-def restart_camera(sensor):
-    os.exitpoint()
-    print("[Sensor] restarting...")
-    try:
-        if isinstance(sensor, Sensor):
-            sensor.stop()
-    except Exception:
-        pass
-    try:
-        MediaManager.deinit()
-    except Exception:
-        pass
-    try:
-        Sensor.deinit()
-    except Exception:
-        pass
-    gc.collect()
-    time.sleep_ms(20)
-    sensor = init_camera_sensor()
-    start_camera(sensor)
-    print("[Sensor] restart done")
-    return sensor
-
-
-class TargetDetector:
     def __init__(self):
         self.target_rect = None
         self.target_center = None
@@ -465,178 +204,6 @@ class TargetDetector:
                 self.bullseye_found = False
                 self.laser_found = False
 
-    def _clamp_rect(self, x, y, w, h):
-        x = max(0, min(FRAME_WIDTH - 1, int(x)))
-        y = max(0, min(FRAME_HEIGHT - 1, int(y)))
-        w = max(1, min(FRAME_WIDTH - x, int(w)))
-        h = max(1, min(FRAME_HEIGHT - y, int(h)))
-        return (x, y, w, h)
-
-    def _distance_sq(self, p0, p1):
-        dx = p0[0] - p1[0]
-        dy = p0[1] - p1[1]
-        return dx * dx + dy * dy
-
-    def _clamp_point(self, point):
-        return (
-            max(0, min(FRAME_WIDTH - 1, int(point[0]))),
-            max(0, min(FRAME_HEIGHT - 1, int(point[1]))),
-        )
-
-    def _smooth_center(self, current, last_center, alpha, reset_px, sticky_px):
-        if last_center is None:
-            return current
-        dist_sq = self._distance_sq(current, last_center)
-        if dist_sq <= (sticky_px * sticky_px):
-            return last_center
-        if dist_sq > (reset_px * reset_px):
-            return current
-        return (
-            int(last_center[0] * (1 - alpha) + current[0] * alpha),
-            int(last_center[1] * (1 - alpha) + current[1] * alpha),
-        )
-
-    def _smooth_scalar(self, current, last_value, alpha):
-        if last_value <= 0:
-            return current
-        return last_value * (1 - alpha) + current * alpha
-
-    def _apply_motion_lead(self, current, last_center, gain, max_px):
-        if current is None or last_center is None or gain <= 0:
-            return current
-        dx = current[0] - last_center[0]
-        dy = current[1] - last_center[1]
-        lead_x = int(dx * gain)
-        lead_y = int(dy * gain)
-        if lead_x > max_px:
-            lead_x = max_px
-        elif lead_x < -max_px:
-            lead_x = -max_px
-        if lead_y > max_px:
-            lead_y = max_px
-        elif lead_y < -max_px:
-            lead_y = -max_px
-        return self._clamp_point((current[0] + lead_x, current[1] + lead_y))
-
-    def _solve_linear_system(self, matrix, values):
-        size = len(values)
-        a = []
-        for row in range(size):
-            current = []
-            for col in range(size):
-                current.append(float(matrix[row][col]))
-            current.append(float(values[row]))
-            a.append(current)
-
-        for col in range(size):
-            pivot = col
-            pivot_abs = abs(a[pivot][col])
-            for row in range(col + 1, size):
-                value_abs = abs(a[row][col])
-                if value_abs > pivot_abs:
-                    pivot = row
-                    pivot_abs = value_abs
-            if pivot_abs < 1e-6:
-                return None
-            if pivot != col:
-                tmp = a[col]
-                a[col] = a[pivot]
-                a[pivot] = tmp
-
-            pivot_value = a[col][col]
-            for idx in range(col, size + 1):
-                a[col][idx] /= pivot_value
-
-            for row in range(size):
-                if row == col:
-                    continue
-                factor = a[row][col]
-                for idx in range(col, size + 1):
-                    a[row][idx] -= factor * a[col][idx]
-
-        result = []
-        for row in range(size):
-            result.append(a[row][size])
-        return tuple(result)
-
-    def _compute_homography(self, src_points, dst_points):
-        matrix = []
-        values = []
-        for idx in range(4):
-            x = float(src_points[idx][0])
-            y = float(src_points[idx][1])
-            u = float(dst_points[idx][0])
-            v = float(dst_points[idx][1])
-            matrix.append([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y])
-            values.append(u)
-            matrix.append([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y])
-            values.append(v)
-
-        solution = self._solve_linear_system(matrix, values)
-        if solution is None:
-            return None
-        return (
-            (solution[0], solution[1], solution[2]),
-            (solution[3], solution[4], solution[5]),
-            (solution[6], solution[7], 1.0),
-        )
-
-    def _apply_homography(self, h, x, y):
-        if h is None:
-            return None
-        denom = h[2][0] * x + h[2][1] * y + h[2][2]
-        if abs(denom) < 1e-6:
-            return None
-        out_x = (h[0][0] * x + h[0][1] * y + h[0][2]) / denom
-        out_y = (h[1][0] * x + h[1][1] * y + h[1][2]) / denom
-        return (out_x, out_y)
-
-    def _normalize_corners(self, corners):
-        sx = 0
-        sy = 0
-        points = []
-        for p in corners:
-            sx += p[0]
-            sy += p[1]
-            points.append((float(p[0]), float(p[1])))
-        center = (sx / 4, sy / 4)
-        points.sort(key=lambda p: math.atan2(p[1] - center[1], p[0] - center[0]))
-
-        top_left_idx = 0
-        best_score = points[0][0] + points[0][1]
-        for idx in range(1, 4):
-            score = points[idx][0] + points[idx][1]
-            if score < best_score:
-                best_score = score
-                top_left_idx = idx
-
-        ordered = []
-        for idx in range(4):
-            ordered.append(points[(top_left_idx + idx) % 4])
-        return ordered
-
-    def _plane_size_cm_for_corners(self, corners):
-        top = math.sqrt((corners[1][0] - corners[0][0]) ** 2 + (corners[1][1] - corners[0][1]) ** 2)
-        right = math.sqrt((corners[2][0] - corners[1][0]) ** 2 + (corners[2][1] - corners[1][1]) ** 2)
-        bottom = math.sqrt((corners[2][0] - corners[3][0]) ** 2 + (corners[2][1] - corners[3][1]) ** 2)
-        left = math.sqrt((corners[3][0] - corners[0][0]) ** 2 + (corners[3][1] - corners[0][1]) ** 2)
-        width_px = (top + bottom) * 0.5
-        height_px = (left + right) * 0.5
-        aspect = width_px / max(height_px, 1e-6)
-        normal_error = abs(aspect - TARGET_ASPECT)
-        swapped_error = abs(aspect - (1.0 / TARGET_ASPECT))
-        if swapped_error < normal_error:
-            return TARGET_HEIGHT_CM, TARGET_WIDTH_CM
-        return TARGET_WIDTH_CM, TARGET_HEIGHT_CM
-
-    def _point_to_target_plane_cm(self, point):
-        if self.image_to_target_h is None:
-            return None
-        projected = self._apply_homography(self.image_to_target_h, point[0], point[1])
-        if projected is None:
-            return None
-        return projected
-
     def _prediction_available(self):
         return (
             self.frozen_target_rect is not None
@@ -657,237 +224,6 @@ class TargetDetector:
         if self.bullseye_center is not None:
             self.frozen_bullseye_center = self.bullseye_center
         self.predict_miss_count = 0
-
-    def _expand_rect(self, rect, margin):
-        x, y, w, h = rect
-        return self._clamp_rect(x - margin, y - margin, w + margin * 2, h + margin * 2)
-
-    def _push_point_history(self, history, point, max_len):
-        history.append(point)
-        if len(history) > max_len:
-            history.pop(0)
-        return history
-
-    def _filter_point_history(self, history):
-        if not history:
-            return None
-        xs = sorted(point[0] for point in history)
-        ys = sorted(point[1] for point in history)
-        mid = len(history) // 2
-        return (xs[mid], ys[mid])
-
-    def _push_scalar_history(self, history, value, max_len):
-        history.append(value)
-        if len(history) > max_len:
-            history.pop(0)
-        return history
-
-    def _filter_scalar_history(self, history):
-        if not history:
-            return 0.0
-        values = sorted(history)
-        return values[len(values) // 2]
-
-    def _rect_aspect_error(self, w, h):
-        aspect = w / max(h, 1)
-        target_inv = 1.0 / TARGET_ASPECT
-        return min(abs(aspect - TARGET_ASPECT), abs(aspect - target_inv))
-
-    def _rect_center_from_corners(self, corners):
-        sx = 0
-        sy = 0
-        points = []
-        for p in corners:
-            sx += p[0]
-            sy += p[1]
-            points.append((p[0], p[1]))
-        avg_center = (sx / 4, sy / 4)
-
-        points.sort(key=lambda p: math.atan2(p[1] - avg_center[1], p[0] - avg_center[0]))
-        p0 = points[0]
-        p1 = points[1]
-        p2 = points[2]
-        p3 = points[3]
-
-        x1 = p0[0]
-        y1 = p0[1]
-        x2 = p2[0]
-        y2 = p2[1]
-        x3 = p1[0]
-        y3 = p1[1]
-        x4 = p3[0]
-        y4 = p3[1]
-
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if abs(denom) < 1:
-            return self._clamp_point(avg_center)
-
-        det1 = x1 * y2 - y1 * x2
-        det2 = x3 * y4 - y3 * x4
-        center_x = (det1 * (x3 - x4) - (x1 - x2) * det2) / denom
-        center_y = (det1 * (y3 - y4) - (y1 - y2) * det2) / denom
-        if center_x < -8 or center_x > (FRAME_WIDTH + 8) or center_y < -8 or center_y > (FRAME_HEIGHT + 8):
-            return self._clamp_point(avg_center)
-        return self._clamp_point((center_x, center_y))
-
-    def _rect_size_change_ok(self, rect, last_rect):
-        if last_rect is None:
-            return True
-        _, _, w, h = rect
-        _, _, last_w, last_h = last_rect
-        if last_w <= 0 or last_h <= 0:
-            return True
-        dw = abs(w - last_w) / last_w
-        dh = abs(h - last_h) / last_h
-        return dw <= TARGET_MAX_SIZE_CHANGE_RATIO and dh <= TARGET_MAX_SIZE_CHANGE_RATIO
-
-    def _compensate_edge_rect(self, rect, last_rect):
-        if last_rect is None:
-            return rect
-        x, y, w, h = rect
-        _, _, last_w, last_h = last_rect
-        if last_w <= 0 or last_h <= 0:
-            return rect
-
-        x2 = x + w
-        y2 = y + h
-        if x <= TARGET_EDGE_MARGIN_PX and w < int(last_w * TARGET_EDGE_COMP_MIN_RATIO):
-            w = last_w
-            x2 = x + w
-        elif x2 >= (FRAME_WIDTH - TARGET_EDGE_MARGIN_PX) and w < int(last_w * TARGET_EDGE_COMP_MIN_RATIO):
-            x = max(0, x2 - last_w)
-            w = FRAME_WIDTH - x if x + last_w > FRAME_WIDTH else last_w
-
-        if y <= TARGET_EDGE_MARGIN_PX and h < int(last_h * TARGET_EDGE_COMP_MIN_RATIO):
-            h = last_h
-            y2 = y + h
-        elif y2 >= (FRAME_HEIGHT - TARGET_EDGE_MARGIN_PX) and h < int(last_h * TARGET_EDGE_COMP_MIN_RATIO):
-            y = max(0, y2 - last_h)
-            h = FRAME_HEIGHT - y if y + last_h > FRAME_HEIGHT else last_h
-
-        return self._clamp_rect(x, y, w, h)
-
-    def _rect_overlap_ratio(self, rect_a, rect_b):
-        if rect_a is None or rect_b is None:
-            return 0.0
-        ax, ay, aw, ah = rect_a
-        bx, by, bw, bh = rect_b
-        ax2 = ax + aw
-        ay2 = ay + ah
-        bx2 = bx + bw
-        by2 = by + bh
-        ix1 = max(ax, bx)
-        iy1 = max(ay, by)
-        ix2 = min(ax2, bx2)
-        iy2 = min(ay2, by2)
-        iw = ix2 - ix1
-        ih = iy2 - iy1
-        if iw <= 0 or ih <= 0:
-            return 0.0
-        inter = iw * ih
-        min_area = min(max(1, aw * ah), max(1, bw * bh))
-        return inter / min_area
-
-    def _rect_border_hit_ratio(self, rect_img, rect):
-        x, y, w, h = rect
-        if w <= 4 or h <= 4:
-            return 0.0
-        inset = max(1, min(6, min(w, h) // 12))
-        x1 = x + inset
-        y1 = y + inset
-        x2 = x + w - 1 - inset
-        y2 = y + h - 1 - inset
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-
-        hits = 0
-        total = 0
-        steps = max(4, TARGET_BORDER_SAMPLE_COUNT)
-        for idx in range(steps):
-            t = idx / max(1, steps - 1)
-            sx = int(x1 + (x2 - x1) * t)
-            sy = int(y1 + (y2 - y1) * t)
-            points = (
-                (sx, y1),
-                (sx, y2),
-                (x1, sy),
-                (x2, sy),
-            )
-            for px, py in points:
-                total += 1
-                try:
-                    if rect_img.get_pixel(px, py):
-                        hits += 1
-                except Exception:
-                    pass
-        if total <= 0:
-            return 0.0
-        return hits / total
-
-    def _select_best_rect(self, rect_img, rects, reference_center, reference_rect):
-        best = None
-        best_score = None
-        image_center = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
-
-        for r in rects:
-            raw_rect = r.rect()
-            corners = r.corners()
-            if raw_rect is None or corners is None or len(corners) != 4:
-                continue
-            rect = self._compensate_edge_rect(raw_rect, reference_rect)
-            x, y, w, h = rect
-            if w < TARGET_MIN_W or h < TARGET_MIN_H:
-                continue
-            area = w * h
-            if area < TARGET_MIN_AREA:
-                continue
-            if not self._rect_size_change_ok(rect, reference_rect):
-                continue
-
-            center = self._rect_center_from_corners(corners)
-            border_hit_ratio = self._rect_border_hit_ratio(rect_img, rect)
-            if border_hit_ratio < TARGET_BORDER_HIT_RATIO_MIN:
-                continue
-            if reference_center is not None:
-                jump_sq = self._distance_sq(center, reference_center)
-                if jump_sq > (TARGET_RESET_DIST_PX * TARGET_RESET_DIST_PX):
-                    continue
-            if reference_rect is not None:
-                overlap_ratio = self._rect_overlap_ratio(rect, reference_rect)
-                if overlap_ratio < TARGET_MIN_OVERLAP_RATIO and (
-                    reference_center is None
-                    or self._distance_sq(center, reference_center) > (TARGET_STICKY_DIST_PX * TARGET_STICKY_DIST_PX)
-                ):
-                    continue
-            aspect_penalty = int(self._rect_aspect_error(w, h) * TARGET_ASPECT_PENALTY_SCALE)
-            if reference_center is not None:
-                distance_penalty = self._distance_sq(center, reference_center) // 10
-            else:
-                distance_penalty = self._distance_sq(center, image_center) // TARGET_INIT_CENTER_BIAS
-            edge_penalty = 0
-            if x <= 2 or y <= 2 or (x + w) >= (FRAME_WIDTH - 2) or (y + h) >= (FRAME_HEIGHT - 2):
-                edge_penalty = 3600
-            center_bias_bonus = 0
-            if self._distance_sq(center, image_center) <= (TARGET_NEAR_CENTER_PX * TARGET_NEAR_CENTER_PX):
-                center_bias_bonus = 2000
-            border_score_bonus = int(border_hit_ratio * TARGET_BORDER_SCORE_SCALE)
-
-            score = area - aspect_penalty - distance_penalty - edge_penalty + center_bias_bonus + border_score_bonus
-            if best_score is None or score > best_score:
-                best_score = score
-                best = (rect, corners, center)
-
-        return best
-
-    def _accept_center(self, candidate_center, last_center):
-        if candidate_center is None or last_center is None:
-            return True
-        return self._distance_sq(candidate_center, last_center) <= (TARGET_MAX_JUMP_PX * TARGET_MAX_JUMP_PX)
-
-    def _prepare_rect_image(self, img):
-        rect_img = img.to_grayscale()
-        rect_img.binary([RECT_BINARY_THRESHOLD])
-        return rect_img
 
     def _refine_bullseye_center(self, img):
         if not (self.target_rect and self.target_center):
@@ -1222,7 +558,7 @@ class CircleTrajectory:
         self.current_angle = 0.0
 
 
-class AimingSystem:
+class AimingSystem(LoopStatsMixin):
     def __init__(self):
         self.detector = TargetDetector()
         self.trajectory = CircleTrajectory(CIRCLE_RADIUS_CM)
@@ -1230,10 +566,7 @@ class AimingSystem:
         self.control_started = False
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
         self.mode = "aim"
-        self.frame_count = 0
-        self.fps = 0.0
-        self.last_fps_time = time.ticks_ms()
-        self.gc_counter = 0
+        self._init_loop_stats(enable_fps=True)
 
     def _update_start_button(self):
         if self.control_started:
@@ -1243,8 +576,7 @@ class AimingSystem:
             print("[Motor] start button pressed, stepper control enabled")
 
     def process_frame(self, img):
-        self.frame_count += 1
-        self.gc_counter += 1
+        self._mark_frame()
         self._update_start_button()
 
         self.detector.detect_all(img)
@@ -1329,19 +661,6 @@ class AimingSystem:
                 scale=1,
             )
 
-    def update_fps(self):
-        current_time = time.ticks_ms()
-        dt = time.ticks_diff(current_time, self.last_fps_time)
-        if dt >= 1000:
-            self.fps = self.frame_count * 1000 / dt
-            self.frame_count = 0
-            self.last_fps_time = current_time
-
-    def maybe_collect_gc(self):
-        if self.gc_counter >= GC_INTERVAL:
-            gc.collect()
-            self.gc_counter = 0
-
     def set_mode(self, mode):
         if mode in ("aim", "circle", "idle"):
             self.mode = mode
@@ -1363,14 +682,16 @@ def main():
     aiming_system = AimingSystem()
 
     print("[Display] init...")
-    init_preview_display()
+    display_init(FRAME_WIDTH, FRAME_HEIGHT)
+    kw = dict(camera_id=CAMERA_ID, width=FRAME_WIDTH, height=FRAME_HEIGHT,
+              hmirror=SENSOR_HMIRROR, vflip=SENSOR_VFLIP)
     try:
         print("[Sensor] init...")
-        sensor = init_camera_sensor()
-        start_camera(sensor)
+        sensor = camera_init(CAMERA_ID)
+        camera_start(sensor, **kw)
     except Exception as e:
-        print(f"[Sensor] start failed, retry by restart: {e}")
-        sensor = restart_camera(None)
+        print("[Sensor] start failed, retry by restart:", e)
+        sensor = camera_restart(None, **kw)
 
     aiming_system.set_mode("aim")
     print("[System] ready")
@@ -1380,35 +701,29 @@ def main():
         while True:
             os.exitpoint()
             try:
-                img = snapshot_with_retry(sensor)
+                img = camera_snapshot(sensor)
                 consecutive_snapshot_failures = 0
             except RuntimeError as e:
                 consecutive_snapshot_failures += 1
                 if consecutive_snapshot_failures >= MAX_CONSECUTIVE_SNAPSHOT_FAILURES:
-                    print(f"[Sensor] snapshot failed repeatedly, restart: {e}")
-                    sensor = restart_camera(sensor)
+                    print("[Sensor] snapshot failed repeatedly, restart:", e)
+                    sensor = camera_restart(sensor, **kw)
                     consecutive_snapshot_failures = 0
                 time.sleep_ms(FRAME_LOOP_DELAY_MS)
                 continue
             img = aiming_system.process_frame(img)
             aiming_system.update_fps()
             Display.show_image(img)
-            aiming_system.maybe_collect_gc()
+            aiming_system.maybe_collect_gc(GC_INTERVAL)
             time.sleep_ms(FRAME_LOOP_DELAY_MS)
     except KeyboardInterrupt:
         print("\n[System] interrupted")
     except Exception as e:
-        print(f"[Error] {e}")
+        print("[Error]", e)
         sys.print_exception(e)
     finally:
         print("[System] cleanup...")
-        if isinstance(sensor, Sensor):
-            sensor.stop()
-        Display.deinit()
-        os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
-        time.sleep_ms(100)
-        MediaManager.deinit()
-        Sensor.deinit()
+        camera_deinit(sensor)
         aiming_system.motor.deinit()
         print("[System] stopped")
 
@@ -1417,13 +732,16 @@ def main_test():
     print("K230 aiming system - test mode")
     apply_calibration()
 
-    sensor = init_camera_sensor()
-    init_preview_display()
+    kw = dict(camera_id=CAMERA_ID, width=FRAME_WIDTH, height=FRAME_HEIGHT,
+              hmirror=SENSOR_HMIRROR, vflip=SENSOR_VFLIP)
+    sensor = camera_init(CAMERA_ID)
+    display_init(FRAME_WIDTH, FRAME_HEIGHT)
     try:
-        start_camera(sensor)
+        camera_start(sensor, **kw)
     except Exception as e:
-        print(f"[Sensor] start failed in test, retry by restart: {e}")
-        sensor = restart_camera(sensor)
+        print("[Sensor] start failed in test, retry:", e)
+        sensor = camera_restart(sensor, **kw)
+
     detector = TargetDetector()
     clock = time.clock()
     frame_count = 0
@@ -1435,32 +753,21 @@ def main_test():
             frame_count += 1
 
             try:
-                img = snapshot_with_retry(sensor)
+                img = camera_snapshot(sensor)
             except RuntimeError as e:
-                print(f"[Sensor] snapshot failed in test, restart: {e}")
-                sensor = restart_camera(sensor)
-                img = snapshot_with_retry(sensor)
+                print("[Sensor] snapshot failed in test, restart:", e)
+                sensor = camera_restart(sensor, **kw)
+                img = camera_snapshot(sensor)
             detector.detect_all(img)
             offset = detector.get_offset_info()
 
             if frame_count % 30 == 0:
                 print("-" * 40)
-                print(
-                    "target:{} bullseye:{} laser:{}".format(
-                        detector.target_found,
-                        detector.bullseye_found,
-                        detector.laser_found,
-                    )
-                )
+                print("target:{} bullseye:{} laser:{}".format(
+                    detector.target_found, detector.bullseye_found, detector.laser_found))
                 if offset:
-                    print(
-                        "offset dx={:.2f} dy={:.2f} dist={:.2f} angle={:.1f}".format(
-                            offset["dx_cm"],
-                            offset["dy_cm"],
-                            offset["distance_cm"],
-                            offset["angle_deg"],
-                        )
-                    )
+                    print("offset dx={:.2f} dy={:.2f} dist={:.2f} angle={:.1f}".format(
+                        offset["dx_cm"], offset["dy_cm"], offset["distance_cm"], offset["angle_deg"]))
                 print("FPS: {:.1f}".format(clock.fps()))
 
             if frame_count % GC_INTERVAL == 0:
@@ -1469,16 +776,10 @@ def main_test():
     except KeyboardInterrupt:
         print("\nstop test")
     except Exception as e:
-        print(f"error: {e}")
+        print("error:", e)
         sys.print_exception(e)
     finally:
-        if isinstance(sensor, Sensor):
-            sensor.stop()
-        Display.deinit()
-        os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
-        time.sleep_ms(100)
-        MediaManager.deinit()
-        Sensor.deinit()
+        camera_deinit(sensor)
         print("test finished")
 
 

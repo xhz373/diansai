@@ -2,6 +2,7 @@ import json
 import os
 import time
 
+from common_hw import map_gpio, map_pwm, pin_out
 
 CALIB_FILE = "/sdcard/app/aiming_calib.json"
 
@@ -16,6 +17,7 @@ DEFAULT_STEPPER_AXES = {
     "x": {
         "name": "X",
         "step_board_pin": 42,
+        "step_pwm_channel": 0,
         "dir_board_pin": 43,
         "dir_gpio_num": 43,
         "enable_board_pin": 44,
@@ -40,6 +42,7 @@ DEFAULT_STEPPER_AXES = {
     "y": {
         "name": "Y",
         "step_board_pin": 47,
+        "step_pwm_channel": 3,
         "dir_board_pin": 45,
         "dir_gpio_num": 45,
         "enable_board_pin": 46,
@@ -131,29 +134,6 @@ def _merge_axis_config(defaults, overrides):
     return merged
 
 
-def _pin_output_mode(pin_cls):
-    for name in ("OUT",):
-        value = getattr(pin_cls, name, None)
-        if value is not None:
-            return value
-    raise AttributeError("Pin.OUT is not available")
-
-
-def _map_board_pin_to_gpio(fpioa, board_pin, gpio_num):
-    if not hasattr(fpioa, "set_function"):
-        return
-    for func_name in (
-        "GPIO{}_FUNC".format(gpio_num),
-        "GPIO{}".format(gpio_num),
-        "GPIOHS{}".format(gpio_num),
-        "GPIOHS{}_FUNC".format(gpio_num),
-    ):
-        func = getattr(fpioa, func_name, None)
-        if func is not None:
-            fpioa.set_function(board_pin, func)
-            return
-
-
 def _clamp(value, low, high):
     if value < low:
         return low
@@ -166,6 +146,7 @@ class StepperAxis:
     def __init__(self, config):
         self.name = config.get("name", "?")
         self.step_board_pin = config.get("step_board_pin")
+        self.step_pwm_channel = config.get("step_pwm_channel", None)
         self.dir_board_pin = config.get("dir_board_pin")
         self.dir_gpio_num = config.get("dir_gpio_num", self.dir_board_pin)
         self.enable_board_pin = config.get("enable_board_pin")
@@ -220,12 +201,14 @@ class StepperAxis:
             FPIOA = getattr(machine, "FPIOA", None)
             if FPIOA is not None:
                 try:
-                    _map_board_pin_to_gpio(FPIOA(), self.dir_board_pin, self.dir_gpio_num)
+                    fpioa = FPIOA()
+                    map_gpio(fpioa, self.dir_board_pin, self.dir_gpio_num)
                     if self.enable_board_pin is not None and self.enable_gpio_num is not None:
-                        _map_board_pin_to_gpio(FPIOA(), self.enable_board_pin, self.enable_gpio_num)
+                        map_gpio(fpioa, self.enable_board_pin, self.enable_gpio_num)
+                    map_pwm(fpioa, self.step_board_pin, self.step_pwm_channel)
                 except Exception:
                     pass
-            output_mode = _pin_output_mode(Pin)
+            output_mode = pin_out()
             try:
                 self._dir_pin = Pin(self.dir_gpio_num, output_mode)
             except Exception:
@@ -258,6 +241,9 @@ class StepperAxis:
             machine = __import__("machine")
             Pin = getattr(machine, "Pin")
             PWM = getattr(machine, "PWM")
+            FPIOA = getattr(machine, "FPIOA", None)
+            if FPIOA is not None:
+                map_pwm(FPIOA(), self.step_board_pin, self.step_pwm_channel)
             self._pwm = PWM(Pin(self.step_board_pin), freq=max(self.min_freq, 1), duty=0)
         except Exception as e:
             self._init_failed = True

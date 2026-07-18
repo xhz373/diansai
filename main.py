@@ -1,5 +1,7 @@
 import sys
+from machine import FPIOA, Pin
 
+from common_hw import map_gpio, pin_pull_up
 
 FLAG = 2
 FLAG_SEQUENCE = (0, 1, 2, 3, 4, 5, 6)
@@ -22,29 +24,6 @@ MODE_BUTTON_SELECT_TIMEOUT_MS = 900
 MODE_BUTTON_POLL_MS = 20
 
 
-def _launcher_pin_pull_up_value(pin_cls):
-    for name in ("PULL_UP", "PULLUP", "PULL_UP_ENABLE"):
-        value = getattr(pin_cls, name, None)
-        if value is not None:
-            return value
-    return None
-
-
-def _launcher_map_board_pin_to_gpio(fpioa, board_pin, gpio_num):
-    if not hasattr(fpioa, "set_function"):
-        return
-    for func_name in (
-        "GPIO{}_FUNC".format(gpio_num),
-        "GPIO{}".format(gpio_num),
-        "GPIOHS{}".format(gpio_num),
-        "GPIOHS{}_FUNC".format(gpio_num),
-    ):
-        func = getattr(fpioa, func_name, None)
-        if func is not None:
-            fpioa.set_function(board_pin, func)
-            return
-
-
 def _next_flag_value(current_flag):
     try:
         index = FLAG_SEQUENCE.index(int(current_flag))
@@ -64,11 +43,11 @@ def _select_flag_from_gpio(default_flag):
 
     try:
         fpioa = FPIOA()
-        pull_up = _launcher_pin_pull_up_value(Pin)
+        pull_up = pin_pull_up()
         buttons = []
         for key_name, board_pin, gpio_num in MODE_BUTTON_CONFIGS:
             try:
-                _launcher_map_board_pin_to_gpio(fpioa, board_pin, gpio_num)
+                map_gpio(fpioa, board_pin, gpio_num)
                 if pull_up is None:
                     try:
                         pin = Pin(gpio_num, Pin.IN)
