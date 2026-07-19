@@ -6,13 +6,28 @@ from common_hw import map_gpio, map_pwm, pin_out
 
 CALIB_FILE = "/sdcard/app/aiming_calib.json"
 
-# Default two-axis stepper wiring. Adjust these board pins to match your driver.
-# Each axis assumes a STEP/DIR/EN driver such as A4988/DRV8825/TB6600.
-# STEP pins are chosen from different PWM frequency groups so X/Y can run at
-# different step rates:
-# - Group A (PWM0/1/2): GPIO42, GPIO43, GPIO46
-# - Group B (PWM3/4/5): GPIO47, GPIO52, GPIO53
-# This layout avoids the already-used GPIO20/28/29/30/31 pins.
+# ── Two-axis stepper wiring ────────────────────────────────────────
+# Board: CanMV-K230-1V  (40-pin header)
+# Driver: A4988 / DRV8825 / TB6600  (STEP + DIR + EN)
+#
+# Pin map (all on the 40P header, no soldering required):
+#
+#   X axis (PWM Group A — PWM0):
+#     STEP = IO42 → header Pin  9   (PWM0)
+#     DIR  = IO43 → header Pin 35   (GPIO)
+#     EN   = IO27 → header Pin 15   (GPIO, clean IO)
+#
+#   Y axis (PWM Group B — PWM4):
+#     STEP = IO52 → header Pin 29   (PWM4)
+#     DIR  = IO53 → header Pin 30   (GPIO)
+#     EN   = IO35 → header Pin 14   (GPIO, IIS pin repurposed)
+#
+# PWM groups let X/Y run at different step rates independently.
+# Btn GPIOs 20/28/29/30/31 are left free.
+# IIC3 (IO44/IO45) and IIC4 (IO46/IO47) are left free for sensors.
+#
+# Motor: 42-step, 1.8°/step, DRV8825 @ 16× microstep (3200 pulse/rev).
+# Frequencies are tuned for gimbal tracking with moderate load.
 DEFAULT_STEPPER_AXES = {
     "x": {
         "name": "X",
@@ -20,16 +35,17 @@ DEFAULT_STEPPER_AXES = {
         "step_pwm_channel": 0,
         "dir_board_pin": 43,
         "dir_gpio_num": 43,
-        "enable_board_pin": 44,
-        "enable_gpio_num": 44,
+        "enable_board_pin": 27,
+        "enable_gpio_num": 27,
         "command_sign": 1,
         "dir_invert": False,
-        "enable_active_low": True,
+        # ENA+ is driven by the GPIO and ENA- is connected to signal GND.
+        "enable_active_low": False,
         "hold_enabled": True,
         "step_duty": 50,
-        "min_freq": 120,
-        "max_freq": 1800,
-        "ramp_hz_per_s": 3200,
+        "min_freq": 200,
+        "max_freq": 6000,
+        "ramp_hz_per_s": 4000,
         "deadband": 0.0,
         "error_full_scale": 80.0,
         "pid_kp": 24.0,
@@ -41,20 +57,21 @@ DEFAULT_STEPPER_AXES = {
     },
     "y": {
         "name": "Y",
-        "step_board_pin": 47,
-        "step_pwm_channel": 3,
-        "dir_board_pin": 45,
-        "dir_gpio_num": 45,
-        "enable_board_pin": 46,
-        "enable_gpio_num": 46,
+        "step_board_pin": 52,
+        "step_pwm_channel": 4,
+        "dir_board_pin": 53,
+        "dir_gpio_num": 53,
+        "enable_board_pin": 35,
+        "enable_gpio_num": 35,
         "command_sign": 1,
         "dir_invert": False,
-        "enable_active_low": True,
+        # ENA+ is driven by the GPIO and ENA- is connected to signal GND.
+        "enable_active_low": False,
         "hold_enabled": True,
         "step_duty": 50,
-        "min_freq": 120,
-        "max_freq": 1800,
-        "ramp_hz_per_s": 3200,
+        "min_freq": 200,
+        "max_freq": 6000,
+        "ramp_hz_per_s": 4000,
         "deadband": 0.0,
         "error_full_scale": 80.0,
         "pid_kp": 24.0,
@@ -183,6 +200,7 @@ class StepperAxis:
         self._integral = 0.0
         self._derivative = 0.0
         self._last_output = 0.0
+        self.output_enabled = True
         self.ready = False
         self._init_failed = False
         self._init_error = ""
@@ -244,7 +262,18 @@ class StepperAxis:
             FPIOA = getattr(machine, "FPIOA", None)
             if FPIOA is not None:
                 map_pwm(FPIOA(), self.step_board_pin, self.step_pwm_channel)
-            self._pwm = PWM(Pin(self.step_board_pin), freq=max(self.min_freq, 1), duty=0)
+            # 优先尝试直接用 PWM 通道号创建（绕过 Pin 的 GPIO 检查，避免
+            # "pin(xx) is not a GPIO pin" 警告），失败则回退到 Pin 方式。
+            try:
+                if self.step_pwm_channel is not None:
+                    self._pwm = PWM(self.step_pwm_channel,
+                                    freq=max(self.min_freq, 1), duty=0)
+                else:
+                    self._pwm = PWM(Pin(self.step_board_pin),
+                                    freq=max(self.min_freq, 1), duty=0)
+            except Exception:
+                self._pwm = PWM(Pin(self.step_board_pin),
+                                freq=max(self.min_freq, 1), duty=0)
         except Exception as e:
             self._init_failed = True
             self._init_error = str(e)
@@ -332,11 +361,20 @@ class StepperAxis:
                 self._pwm.duty(0)
             except Exception:
                 pass
-        if not self.hold_enabled:
-            self._write_enable(False)
+        self._write_enable(self.hold_enabled if self.output_enabled else False)
+
+    def disable(self):
+        """Release the driver and keep all future output disabled."""
+        self.output_enabled = False
+        self.stop()
+        self._write_enable(False)
+
+    def enable(self):
+        """Allow output again; the next command can enable the driver."""
+        self.output_enabled = True
 
     def drive_error(self, error_value, allow_drive=True):
-        if (not self.ready) or (not allow_drive) or (error_value is None):
+        if (not self.ready) or (not self.output_enabled) or (not allow_drive) or (error_value is None):
             self.stop()
             self._last_update_ms = time.ticks_ms()
             return
@@ -372,6 +410,7 @@ class StepperAxis:
         self._set_pwm(self._current_freq, self.step_duty)
 
     def deinit(self):
+        self.output_enabled = False
         self.stop()
         if self._pwm is not None:
             try:
@@ -397,6 +436,14 @@ class DualAxisStepperController:
     def stop(self):
         self.x_axis.stop()
         self.y_axis.stop()
+
+    def disable(self):
+        self.x_axis.disable()
+        self.y_axis.disable()
+
+    def enable(self):
+        self.x_axis.enable()
+        self.y_axis.enable()
 
     def deinit(self):
         self.x_axis.deinit()

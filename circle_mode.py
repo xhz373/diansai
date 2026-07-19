@@ -8,6 +8,16 @@ from common_hw import (DebouncedButton as StartButton, Display, draw_text,
                         camera_init, camera_start, camera_snapshot,
                         camera_restart, camera_deinit,
                         display_init)
+from vision_utils import (CircleState, clamp_point, clamp_rect, dist_sq,
+                           smooth_center, smooth_scalar, apply_motion_lead,
+                           push_point_history, filter_point_history,
+                           push_scalar_history, filter_scalar_history,
+                           rect_aspect_error, rect_center_from_corners,
+                           rect_size_change_ok, compensate_edge_rect,
+                           rect_overlap_ratio, rect_border_hit_ratio,
+                           expand_rect, compute_homography, apply_homography,
+                           normalize_corners, plane_size_cm_for_corners,
+                           log_info, log_warn, log_error)
 
 try:
     from k230_common import build_stepper_controller, load_calibration
@@ -115,6 +125,10 @@ FRAME_LOOP_DELAY_MS = 0
 OVERLAY_RING_SAMPLE_COUNT = 18
 GC_FRAME_INTERVAL = 180
 BUILD_TAG = "2026-07-14-circle-fastboot-v31"
+
+# ── Testing without button board ──────────────────────────────────
+# Set True to skip GPIO28 start-button wait.
+AUTO_START = True
 ERROR_JUMP_MAX_CM = 3.0
 ERROR_JUMP_REJECT_FRAMES = 2
 
@@ -278,168 +292,22 @@ class TargetDetector:
                 self.laser_found = False
                 self.detected_ring_radius_cm = CIRCLE_RADIUS_CM
 
-    def _clamp_rect(self, x, y, w, h):
-        x = max(0, min(FRAME_WIDTH - 1, int(x)))
-        y = max(0, min(FRAME_HEIGHT - 1, int(y)))
-        w = max(1, min(FRAME_WIDTH - x, int(w)))
-        h = max(1, min(FRAME_HEIGHT - y, int(h)))
-        return (x, y, w, h)
+    # geometry/coordinate helpers from vision_utils:
+    #   clamp_point, clamp_rect, dist_sq, smooth_center, smooth_scalar,
+    #   apply_motion_lead, rect_aspect_error, rect_center_from_corners,
+    #   rect_size_change_ok, compensate_edge_rect, rect_overlap_ratio,
+    #   rect_border_hit_ratio, expand_rect, compute_homography,
+    #   apply_homography, normalize_corners, plane_size_cm_for_corners,
+    #   push_point_history, filter_point_history,
+    #   push_scalar_history, filter_scalar_history
 
-    def _distance_sq(self, p0, p1):
-        dx = p0[0] - p1[0]
-        dy = p0[1] - p1[1]
-        return dx * dx + dy * dy
-
-    def _smooth_center(self, current, last_center, alpha, reset_px, sticky_px):
-        if last_center is None:
-            return current
-        dist_sq = self._distance_sq(current, last_center)
-        if dist_sq <= (sticky_px * sticky_px):
-            return last_center
-        if dist_sq > (reset_px * reset_px):
-            return current
-        return (
-            int(last_center[0] * (1 - alpha) + current[0] * alpha),
-            int(last_center[1] * (1 - alpha) + current[1] * alpha),
-        )
-
-    def _smooth_scalar(self, current, last_value, alpha):
-        if last_value <= 0:
-            return current
-        return last_value * (1 - alpha) + current * alpha
-
-    def _apply_motion_lead(self, current, last_center, gain, max_px):
-        if current is None or last_center is None or gain <= 0:
-            return current
-        dx = current[0] - last_center[0]
-        dy = current[1] - last_center[1]
-        lead_x = int(dx * gain)
-        lead_y = int(dy * gain)
-        if lead_x > max_px:
-            lead_x = max_px
-        elif lead_x < -max_px:
-            lead_x = -max_px
-        if lead_y > max_px:
-            lead_y = max_px
-        elif lead_y < -max_px:
-            lead_y = -max_px
-        return self._clamp_point((current[0] + lead_x, current[1] + lead_y))
-
-    def _solve_linear_system(self, matrix, values):
-        size = len(values)
-        a = []
-        for row in range(size):
-            current = []
-            for col in range(size):
-                current.append(float(matrix[row][col]))
-            current.append(float(values[row]))
-            a.append(current)
-
-        for col in range(size):
-            pivot = col
-            pivot_abs = abs(a[pivot][col])
-            for row in range(col + 1, size):
-                value_abs = abs(a[row][col])
-                if value_abs > pivot_abs:
-                    pivot = row
-                    pivot_abs = value_abs
-            if pivot_abs < 1e-6:
-                return None
-            if pivot != col:
-                tmp = a[col]
-                a[col] = a[pivot]
-                a[pivot] = tmp
-
-            pivot_value = a[col][col]
-            for idx in range(col, size + 1):
-                a[col][idx] /= pivot_value
-
-            for row in range(size):
-                if row == col:
-                    continue
-                factor = a[row][col]
-                for idx in range(col, size + 1):
-                    a[row][idx] -= factor * a[col][idx]
-
-        result = []
-        for row in range(size):
-            result.append(a[row][size])
-        return tuple(result)
-
-    def _compute_homography(self, src_points, dst_points):
-        matrix = []
-        values = []
-        for idx in range(4):
-            x = float(src_points[idx][0])
-            y = float(src_points[idx][1])
-            u = float(dst_points[idx][0])
-            v = float(dst_points[idx][1])
-            matrix.append([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y])
-            values.append(u)
-            matrix.append([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y])
-            values.append(v)
-
-        solution = self._solve_linear_system(matrix, values)
-        if solution is None:
-            return None
-        return (
-            (solution[0], solution[1], solution[2]),
-            (solution[3], solution[4], solution[5]),
-            (solution[6], solution[7], 1.0),
-        )
-
-    def _apply_homography(self, h, x, y):
-        if h is None:
-            return None
-        denom = h[2][0] * x + h[2][1] * y + h[2][2]
-        if abs(denom) < 1e-6:
-            return None
-        out_x = (h[0][0] * x + h[0][1] * y + h[0][2]) / denom
-        out_y = (h[1][0] * x + h[1][1] * y + h[1][2]) / denom
-        return (out_x, out_y)
-
-    def _normalize_corners(self, corners):
-        sx = 0
-        sy = 0
-        points = []
-        for p in corners:
-            sx += p[0]
-            sy += p[1]
-            points.append((float(p[0]), float(p[1])))
-        center = (sx / 4, sy / 4)
-        points.sort(key=lambda p: math.atan2(p[1] - center[1], p[0] - center[0]))
-
-        top_left_idx = 0
-        best_score = points[0][0] + points[0][1]
-        for idx in range(1, 4):
-            score = points[idx][0] + points[idx][1]
-            if score < best_score:
-                best_score = score
-                top_left_idx = idx
-
-        ordered = []
-        for idx in range(4):
-            ordered.append(points[(top_left_idx + idx) % 4])
-        return ordered
-
-    def _plane_size_cm_for_corners(self, corners):
-        top = math.sqrt((corners[1][0] - corners[0][0]) ** 2 + (corners[1][1] - corners[0][1]) ** 2)
-        right = math.sqrt((corners[2][0] - corners[1][0]) ** 2 + (corners[2][1] - corners[1][1]) ** 2)
-        bottom = math.sqrt((corners[2][0] - corners[3][0]) ** 2 + (corners[2][1] - corners[3][1]) ** 2)
-        left = math.sqrt((corners[3][0] - corners[0][0]) ** 2 + (corners[3][1] - corners[0][1]) ** 2)
-        width_px = (top + bottom) * 0.5
-        height_px = (left + right) * 0.5
-        aspect = width_px / max(height_px, 1e-6)
-        normal_error = abs(aspect - TARGET_ASPECT)
-        swapped_error = abs(aspect - (1.0 / TARGET_ASPECT))
-        if swapped_error < normal_error:
-            return TARGET_HEIGHT_CM, TARGET_WIDTH_CM
-        return TARGET_WIDTH_CM, TARGET_HEIGHT_CM
+    def _clamp_point(self, point):
+        return clamp_point(point, FRAME_WIDTH, FRAME_HEIGHT)
 
     def target_plane_cm_to_image(self, dx_cm, dy_cm):
         if self.target_to_image_h is None:
             return None
-        projected = self._apply_homography(self.target_to_image_h, dx_cm, dy_cm)
+        projected = apply_homography(self.target_to_image_h, dx_cm, dy_cm)
         if projected is None:
             return None
         return self._clamp_point(projected)
@@ -447,7 +315,7 @@ class TargetDetector:
     def _point_to_target_plane_cm(self, point):
         if self.image_to_target_h is None:
             return None
-        projected = self._apply_homography(self.image_to_target_h, point[0], point[1])
+        projected = apply_homography(self.image_to_target_h, point[0], point[1])
         if projected is None:
             return None
         return projected
@@ -483,35 +351,7 @@ class TargetDetector:
             self.frozen_bullseye_center = self.bullseye_center
         self.predict_miss_count = 0
 
-    def _expand_rect(self, rect, margin):
-        x, y, w, h = rect
-        return self._clamp_rect(x - margin, y - margin, w + margin * 2, h + margin * 2)
-
-    def _push_point_history(self, history, point):
-        history.append(point)
-        if len(history) > POINT_HISTORY_LEN:
-            history.pop(0)
-        return history
-
-    def _filter_point_history(self, history):
-        if not history:
-            return None
-        xs = sorted(point[0] for point in history)
-        ys = sorted(point[1] for point in history)
-        mid = len(history) // 2
-        return (xs[mid], ys[mid])
-
-    def _push_scalar_history(self, history, value):
-        history.append(value)
-        if len(history) > POINT_HISTORY_LEN:
-            history.pop(0)
-        return history
-
-    def _filter_scalar_history(self, history):
-        if not history:
-            return 0.0
-        values = sorted(history)
-        return values[len(values) // 2]
+    # ── methods that need self state (not in vision_utils) ──────────
 
     def _pixel_to_cm_avg(self):
         values = []
@@ -539,147 +379,6 @@ class TargetDetector:
             return self.detected_ring_radius_cm
         return CIRCLE_RADIUS_CM
 
-    def _rect_aspect_error(self, w, h):
-        aspect = w / max(h, 1)
-        target_inv = 1.0 / TARGET_ASPECT
-        return min(abs(aspect - TARGET_ASPECT), abs(aspect - target_inv))
-
-    def _rect_center_from_corners(self, corners):
-        sx = 0
-        sy = 0
-        points = []
-        for p in corners:
-            sx += p[0]
-            sy += p[1]
-            points.append((p[0], p[1]))
-        avg_center = (sx / 4, sy / 4)
-
-        points.sort(key=lambda p: math.atan2(p[1] - avg_center[1], p[0] - avg_center[0]))
-        p0 = points[0]
-        p1 = points[1]
-        p2 = points[2]
-        p3 = points[3]
-
-        x1 = p0[0]
-        y1 = p0[1]
-        x2 = p2[0]
-        y2 = p2[1]
-        x3 = p1[0]
-        y3 = p1[1]
-        x4 = p3[0]
-        y4 = p3[1]
-
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if abs(denom) < 1:
-            return self._clamp_point(avg_center)
-
-        det1 = x1 * y2 - y1 * x2
-        det2 = x3 * y4 - y3 * x4
-        center_x = (det1 * (x3 - x4) - (x1 - x2) * det2) / denom
-        center_y = (det1 * (y3 - y4) - (y1 - y2) * det2) / denom
-        if center_x < -8 or center_x > (FRAME_WIDTH + 8) or center_y < -8 or center_y > (FRAME_HEIGHT + 8):
-            return self._clamp_point(avg_center)
-        return self._clamp_point((center_x, center_y))
-
-    def _clamp_point(self, point):
-        return (
-            max(0, min(FRAME_WIDTH - 1, int(point[0]))),
-            max(0, min(FRAME_HEIGHT - 1, int(point[1]))),
-        )
-
-    def _rect_size_change_ok(self, rect, last_rect):
-        if last_rect is None:
-            return True
-        _, _, w, h = rect
-        _, _, last_w, last_h = last_rect
-        if last_w <= 0 or last_h <= 0:
-            return True
-        dw = abs(w - last_w) / last_w
-        dh = abs(h - last_h) / last_h
-        return dw <= TARGET_MAX_SIZE_CHANGE_RATIO and dh <= TARGET_MAX_SIZE_CHANGE_RATIO
-
-    def _compensate_edge_rect(self, rect, last_rect):
-        if last_rect is None:
-            return rect
-        x, y, w, h = rect
-        _, _, last_w, last_h = last_rect
-        if last_w <= 0 or last_h <= 0:
-            return rect
-
-        x2 = x + w
-        y2 = y + h
-        if x <= TARGET_EDGE_MARGIN_PX and w < int(last_w * TARGET_EDGE_COMP_MIN_RATIO):
-            w = last_w
-            x2 = x + w
-        elif x2 >= (FRAME_WIDTH - TARGET_EDGE_MARGIN_PX) and w < int(last_w * TARGET_EDGE_COMP_MIN_RATIO):
-            x = max(0, x2 - last_w)
-            w = FRAME_WIDTH - x if x + last_w > FRAME_WIDTH else last_w
-
-        if y <= TARGET_EDGE_MARGIN_PX and h < int(last_h * TARGET_EDGE_COMP_MIN_RATIO):
-            h = last_h
-            y2 = y + h
-        elif y2 >= (FRAME_HEIGHT - TARGET_EDGE_MARGIN_PX) and h < int(last_h * TARGET_EDGE_COMP_MIN_RATIO):
-            y = max(0, y2 - last_h)
-            h = FRAME_HEIGHT - y if y + last_h > FRAME_HEIGHT else last_h
-
-        return self._clamp_rect(x, y, w, h)
-
-    def _rect_overlap_ratio(self, rect_a, rect_b):
-        if rect_a is None or rect_b is None:
-            return 0.0
-        ax, ay, aw, ah = rect_a
-        bx, by, bw, bh = rect_b
-        ax2 = ax + aw
-        ay2 = ay + ah
-        bx2 = bx + bw
-        by2 = by + bh
-        ix1 = max(ax, bx)
-        iy1 = max(ay, by)
-        ix2 = min(ax2, bx2)
-        iy2 = min(ay2, by2)
-        iw = ix2 - ix1
-        ih = iy2 - iy1
-        if iw <= 0 or ih <= 0:
-            return 0.0
-        inter = iw * ih
-        min_area = min(max(1, aw * ah), max(1, bw * bh))
-        return inter / min_area
-
-    def _rect_border_hit_ratio(self, rect_img, rect):
-        x, y, w, h = rect
-        if w <= 4 or h <= 4:
-            return 0.0
-        inset = max(1, min(6, min(w, h) // 12))
-        x1 = x + inset
-        y1 = y + inset
-        x2 = x + w - 1 - inset
-        y2 = y + h - 1 - inset
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-
-        hits = 0
-        total = 0
-        steps = max(4, TARGET_BORDER_SAMPLE_COUNT)
-        for idx in range(steps):
-            t = idx / max(1, steps - 1)
-            sx = int(x1 + (x2 - x1) * t)
-            sy = int(y1 + (y2 - y1) * t)
-            points = (
-                (sx, y1),
-                (sx, y2),
-                (x1, sy),
-                (x2, sy),
-            )
-            for px, py in points:
-                total += 1
-                try:
-                    if rect_img.get_pixel(px, py):
-                        hits += 1
-                except Exception:
-                    pass
-        if total <= 0:
-            return 0.0
-        return hits / total
 
     def _select_best_rect(self, rect_img, rects, reference_center, reference_rect):
         best = None
@@ -691,41 +390,41 @@ class TargetDetector:
             corners = r.corners()
             if raw_rect is None or corners is None or len(corners) != 4:
                 continue
-            rect = self._compensate_edge_rect(raw_rect, reference_rect)
+            rect = compensate_edge_rect(raw_rect, reference_rect)
             x, y, w, h = rect
             if w < TARGET_MIN_W or h < TARGET_MIN_H:
                 continue
             area = w * h
             if area < TARGET_MIN_AREA:
                 continue
-            if not self._rect_size_change_ok(rect, reference_rect):
+            if not rect_size_change_ok(rect, reference_rect):
                 continue
 
-            center = self._rect_center_from_corners(corners)
-            border_hit_ratio = self._rect_border_hit_ratio(rect_img, rect)
+            center = rect_center_from_corners(corners)
+            border_hit_ratio = rect_border_hit_ratio(rect_img, rect)
             if border_hit_ratio < TARGET_BORDER_HIT_RATIO_MIN:
                 continue
             if reference_center is not None:
-                jump_sq = self._distance_sq(center, reference_center)
+                jump_sq = dist_sq(center, reference_center)
                 if jump_sq > (TARGET_RESET_DIST_PX * TARGET_RESET_DIST_PX):
                     continue
             if reference_rect is not None:
-                overlap_ratio = self._rect_overlap_ratio(rect, reference_rect)
+                overlap_ratio = rect_overlap_ratio(rect, reference_rect)
                 if overlap_ratio < TARGET_MIN_OVERLAP_RATIO and (
                     reference_center is None
-                    or self._distance_sq(center, reference_center) > (TARGET_STICKY_DIST_PX * TARGET_STICKY_DIST_PX)
+                    or dist_sq(center, reference_center) > (TARGET_STICKY_DIST_PX * TARGET_STICKY_DIST_PX)
                 ):
                     continue
-            aspect_penalty = int(self._rect_aspect_error(w, h) * TARGET_ASPECT_PENALTY_SCALE)
+            aspect_penalty = int(rect_aspect_error(w, h) * TARGET_ASPECT_PENALTY_SCALE)
             if reference_center is not None:
-                distance_penalty = self._distance_sq(center, reference_center) // 10
+                distance_penalty = dist_sq(center, reference_center) // 10
             else:
-                distance_penalty = self._distance_sq(center, image_center) // TARGET_INIT_CENTER_BIAS
+                distance_penalty = dist_sq(center, image_center) // TARGET_INIT_CENTER_BIAS
             edge_penalty = 0
             if x <= 2 or y <= 2 or (x + w) >= (FRAME_WIDTH - 2) or (y + h) >= (FRAME_HEIGHT - 2):
                 edge_penalty = 3600
             center_bias_bonus = 0
-            if self._distance_sq(center, image_center) <= (TARGET_NEAR_CENTER_PX * TARGET_NEAR_CENTER_PX):
+            if dist_sq(center, image_center) <= (TARGET_NEAR_CENTER_PX * TARGET_NEAR_CENTER_PX):
                 center_bias_bonus = 2000
             border_score_bonus = int(border_hit_ratio * TARGET_BORDER_SCORE_SCALE)
 
@@ -738,7 +437,7 @@ class TargetDetector:
     def _accept_center(self, candidate_center, last_center):
         if candidate_center is None or last_center is None:
             return True
-        return self._distance_sq(candidate_center, last_center) <= (TARGET_MAX_JUMP_PX * TARGET_MAX_JUMP_PX)
+        return dist_sq(candidate_center, last_center) <= (TARGET_MAX_JUMP_PX * TARGET_MAX_JUMP_PX)
 
     def _prepare_rect_image(self, img):
         rect_img = img.to_grayscale()
@@ -782,7 +481,7 @@ class TargetDetector:
         for blob in blobs:
             bx = blob.cx()
             by = blob.cy()
-            dist_sq = self._distance_sq((bx, by), self.target_center)
+            dist_sq = dist_sq((bx, by), self.target_center)
             if dist_sq > gate_sq:
                 continue
             weight = max(1.0, float(blob.pixels()))
@@ -851,14 +550,14 @@ class TargetDetector:
         self.target_miss_count = 0
         rect, corners, center = chosen
         self.target_rect = rect
-        self.target_center = self._smooth_center(
+        self.target_center = smooth_center(
             center,
             previous_center,
             TARGET_CENTER_ALPHA,
             TARGET_RESET_DIST_PX,
             TARGET_STICKY_DIST_PX,
         )
-        self.target_center = self._apply_motion_lead(
+        self.target_center = apply_motion_lead(
             self.target_center,
             previous_center,
             TARGET_LEAD_GAIN,
@@ -885,14 +584,14 @@ class TargetDetector:
             return
 
         refined_center = self._refine_bullseye_center(img)
-        self.bullseye_center = self._smooth_center(
+        self.bullseye_center = smooth_center(
             refined_center,
             self.last_bullseye_center,
             BULLSEYE_CENTER_ALPHA,
             TARGET_RESET_DIST_PX,
             TARGET_STICKY_DIST_PX,
         )
-        self.bullseye_center = self._apply_motion_lead(
+        self.bullseye_center = apply_motion_lead(
             self.bullseye_center,
             self.last_bullseye_center,
             BULLSEYE_LEAD_GAIN,
@@ -910,7 +609,7 @@ class TargetDetector:
         roi = self.target_rect
         if not self.target_found:
             margin = max(LASER_PREDICT_ROI_MARGIN_PX, self.target_diameter_px // 2)
-            roi = self._expand_rect(roi, margin)
+            roi = expand_rect(roi, margin)
 
         blobs = img.find_blobs(
             [VIOLET_THRESHOLD],
@@ -926,14 +625,14 @@ class TargetDetector:
             candidate_blobs = [
                 blob
                 for blob in blobs
-                if self._distance_sq((blob.cx(), blob.cy()), reference) <= gate_sq
+                if dist_sq((blob.cx(), blob.cy()), reference) <= gate_sq
             ]
             if not candidate_blobs:
                 candidate_blobs = blobs
             best = min(
                 candidate_blobs,
                 key=lambda b: (
-                    self._distance_sq((b.cx(), b.cy()), reference),
+                    dist_sq((b.cx(), b.cy()), reference),
                     -b.density(),
                 ),
             )
@@ -941,15 +640,15 @@ class TargetDetector:
             if self.last_laser_spot is None:
                 self.laser_spot = raw_spot
             else:
-                self.laser_spot = self._smooth_center(
+                self.laser_spot = smooth_center(
                     raw_spot,
                     self.last_laser_spot,
                     0.9,
                     LASER_STICKY_PX * 3,
                     LASER_STICKY_PX,
                 )
-            self._push_point_history(self.laser_spot_history, self.laser_spot)
-            self.laser_spot = self._filter_point_history(self.laser_spot_history)
+            push_point_history(self.laser_spot_history, self.laser_spot)
+            self.laser_spot = filter_point_history(self.laser_spot_history)
             self.laser_found = True
             self.last_laser_spot = self.laser_spot
             self.laser_miss_count = 0
@@ -957,8 +656,8 @@ class TargetDetector:
             self.laser_miss_count += 1
             if self.last_laser_spot is not None and self.laser_miss_count <= LASER_MAX_MISS_FRAMES:
                 self.laser_spot = self.last_laser_spot
-                self._push_point_history(self.laser_spot_history, self.laser_spot)
-                self.laser_spot = self._filter_point_history(self.laser_spot_history)
+                push_point_history(self.laser_spot_history, self.laser_spot)
+                self.laser_spot = filter_point_history(self.laser_spot_history)
                 self.laser_found = True
             else:
                 self.laser_spot_history = []
@@ -1057,13 +756,13 @@ class TargetDetector:
 
         detected_radius = best_cluster["radius"]
         if self.last_detected_ring_radius_cm > 0:
-            detected_radius = self._smooth_scalar(
+            detected_radius = smooth_scalar(
                 detected_radius,
                 self.last_detected_ring_radius_cm,
                 CIRCLE_RADIUS_SMOOTHING_ALPHA,
             )
-        self._push_scalar_history(self.ring_radius_cm_history, detected_radius)
-        detected_radius = self._filter_scalar_history(self.ring_radius_cm_history)
+        push_scalar_history(self.ring_radius_cm_history, detected_radius)
+        detected_radius = filter_scalar_history(self.ring_radius_cm_history)
         self.detected_ring_radius_cm = detected_radius
         self.last_detected_ring_radius_cm = detected_radius
 
@@ -1077,8 +776,8 @@ class TargetDetector:
             return
 
         corners = self.last_target_corners
-        ordered_corners = self._normalize_corners(corners)
-        width_cm, height_cm = self._plane_size_cm_for_corners(ordered_corners)
+        ordered_corners = normalize_corners(corners)
+        width_cm, height_cm = plane_size_cm_for_corners(ordered_corners)
         plane_corners = (
             (-width_cm * 0.5, height_cm * 0.5),
             (width_cm * 0.5, height_cm * 0.5),
@@ -1086,8 +785,8 @@ class TargetDetector:
             (-width_cm * 0.5, -height_cm * 0.5),
         )
         self.target_plane_corners_cm = plane_corners
-        self.target_to_image_h = self._compute_homography(plane_corners, ordered_corners)
-        self.image_to_target_h = self._compute_homography(ordered_corners, plane_corners)
+        self.target_to_image_h = compute_homography(plane_corners, ordered_corners)
+        self.image_to_target_h = compute_homography(ordered_corners, plane_corners)
         edges = []
         for idx in range(4):
             p0 = ordered_corners[idx]
@@ -1111,16 +810,16 @@ class TargetDetector:
             (CIRCLE_RADIUS_CM / self.pixel_to_cm_x)
             + (CIRCLE_RADIUS_CM / self.pixel_to_cm_y)
         ) * 0.5
-        self.circle_radius_px = self._smooth_scalar(
+        self.circle_radius_px = smooth_scalar(
             radius_px,
             self.last_circle_radius_px,
             CIRCLE_RADIUS_SMOOTHING_ALPHA,
         )
-        self._push_scalar_history(
+        push_scalar_history(
             self.circle_radius_history,
             self.circle_radius_px,
         )
-        self.circle_radius_px = self._filter_scalar_history(
+        self.circle_radius_px = filter_scalar_history(
             self.circle_radius_history
         )
         self.last_circle_radius_px = self.circle_radius_px
@@ -1150,11 +849,11 @@ class CircleModeSystem:
         self.detector = TargetDetector()
         self.tracker = CircleTracker()
         self.motor = build_stepper_controller(STEPPER_AXIS_OVERRIDES)
-        self.control_started = False
+        self.control_started = AUTO_START
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
         self.frame_count = 0
         self.gc_counter = 0
-        self.state = "IDLE"
+        self.state = CircleState.IDLE
         self.start_align_frames = 0
         self.last_sent_error = None
         self.error_jump_count = 0
@@ -1230,24 +929,24 @@ class CircleModeSystem:
         self.detector.detect_all(img)
         self._update_start_button()
 
-        if self.state == "IDLE":
+        if self.state == CircleState.IDLE:
             self.motor.stop()
             if self.detector.target_found and self.detector.bullseye_found:
-                self.state = "WAITING"
+                self.state = CircleState.WAITING
                 self.start_align_frames = 0
                 self.tracker.reset()
                 print("[State] target ready -> WAITING")
-        elif self.state == "WAITING":
+        elif self.state == CircleState.WAITING:
             self.motor.stop()
             if self._check_start_alignment():
-                self.state = "RUNNING"
+                self.state = CircleState.RUNNING
                 self.tracker.reset()
                 self.tracker.start()
                 self.start_align_frames = 0
                 print("[State] laser aligned with start point -> RUNNING")
-        elif self.state == "RUNNING":
+        elif self.state == CircleState.RUNNING:
             if not self.control_started:
-                self.state = "WAITING"
+                self.state = CircleState.WAITING
                 self.tracker.reset()
                 self.start_align_frames = 0
                 self.last_sent_error = None
@@ -1338,16 +1037,16 @@ class CircleModeSystem:
 
         if DEBUG_TEXT_OVERLAY:
             state_colors = {
-                "IDLE": (128, 128, 128),
-                "WAITING": (255, 255, 0),
-                "RUNNING": (0, 255, 0),
+                CircleState.IDLE: (128, 128, 128),
+                CircleState.WAITING: (255, 255, 0),
+                CircleState.RUNNING: (0, 255, 0),
                 "COMPLETE": (0, 255, 255),
                 "ERROR": (255, 0, 0),
             }
             color = state_colors.get(self.state, (255, 255, 255))
-            draw_text(img, 10, 10, f"State: {self.state}", color=color, scale=2)
+            draw_text(img, 10, 10, "State: " + CircleState.name(self.state), color=color, scale=2)
 
-            if self.state == "WAITING":
+            if self.state == CircleState.WAITING:
                 start_error_cm = self._start_point_error_cm()
                 if start_error_cm is None:
                     text = "Align laser to start point"
@@ -1366,7 +1065,7 @@ class CircleModeSystem:
                     scale=1,
                 )
 
-            if self.state == "RUNNING":
+            if self.state == CircleState.RUNNING:
                 target = self.tracker.get_current_target()
                 if target:
                     target_dx = target["dx_cm"]

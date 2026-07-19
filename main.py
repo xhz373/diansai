@@ -1,4 +1,6 @@
 import sys
+sys.path.insert(0, '/sdcard/app')
+
 from machine import FPIOA, Pin
 
 from common_hw import map_gpio, pin_pull_up

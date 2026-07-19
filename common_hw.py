@@ -16,17 +16,17 @@ from machine import FPIOA, Pin
 try:
     from media.sensor import Sensor                                             # noqa: F401
 except ImportError:
-    Sensor = None                                                                # type: ignore
+    Sensor = None                                                               # type: ignore
 
 try:
     from media.media import MediaManager                                        # noqa: F401
 except ImportError:
-    MediaManager = None                                                          # type: ignore
+    MediaManager = None                                                         # type: ignore
 
 try:
-    from media.display import Display                                            # noqa: F401
+    from media.display import Display                                           # noqa: F401
 except ImportError:
-    Display = None                                                               # type: ignore
+    Display = None                                                              # type: ignore
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -105,13 +105,7 @@ def pin_out():
 # ═══════════════════════════════════════════════════════════════
 
 class DebouncedButton:
-    """Single debounced, latched hardware button.
-
-    Wiring:  GPIO pin → button → GND  (active-low, internal pull-up).
-
-    Once pressed (after debounce), the button *latches* and
-    ``poll_pressed()`` keeps returning ``True`` until ``reset()`` is called.
-    """
+    """Single debounced, latched hardware button."""
 
     def __init__(self, board_pin, gpio_num, debounce_ms=35):
         self.pin = None
@@ -145,7 +139,6 @@ class DebouncedButton:
             self.ready = False
 
     def poll_pressed(self):
-        """Return ``True`` once when the button is pressed (latched edge-detect)."""
         if self.latched or self.pin is None:
             return self.latched
         now = time.ticks_ms()
@@ -167,21 +160,14 @@ class DebouncedButton:
         return False
 
     def reset(self):
-        """Clear the latch so the button can fire again."""
         self.latched = False
 
 
-# Backward-compatible alias used by the three run-mode scripts.
 StartButton = DebouncedButton
 
 
 class MultiButton:
-    """Four-button input system for calibration mode.
-
-    Wiring: GPIO pin → button → GND  (active-low, internal pull-up).
-    Polls ``poll_events()`` returning ``(key_name, event_type)`` tuples
-    where *event_type* is ``"press"``, ``"short"``, ``"long"``, or ``"repeat"``.
-    """
+    """Four-button input system for calibration mode."""
 
     def __init__(self, button_configs, debounce_ms=35,
                  long_press_ms=700, repeat_delay_ms=320, repeat_ms=70):
@@ -234,7 +220,6 @@ class MultiButton:
             print("[Keys] init failed")
 
     def poll_events(self):
-        """Return a list of ``(key_name, event_type)`` for this poll cycle."""
         events = []
         now = time.ticks_ms()
         for name in list(self.buttons.keys()):
@@ -286,7 +271,6 @@ class MultiButton:
 # ═══════════════════════════════════════════════════════════════
 
 def draw_text(img, x, y, text, color=(255, 255, 255), scale=1):
-    """Draw a string on *img*, choosing the best available API."""
     text = str(text)
     if hasattr(img, "draw_string_advanced"):
         img.draw_string_advanced(x, y, max(16, 16 * scale), text, color=color)
@@ -298,15 +282,17 @@ def draw_text(img, x, y, text, color=(255, 255, 255), scale=1):
 #  Camera / display helpers
 # ═══════════════════════════════════════════════════════════════
 
-_ACTIVE_CHN = None   # CAM_CHN_ID_1 (1) or CAM_CHN_ID_0 (0)
+_ACTIVE_CHN = 0  # 彻底锁死在 chn0
 
 
 def _chn_name(chn):
+    if chn == 2:
+        return "chn2"
     return "chn1" if chn == 1 else "chn0"
 
 
-def camera_configure(sensor, width, height, hmirror=True, vflip=True, chn=1):
-    """Reset sensor and configure resolution / pixel format."""
+def camera_configure(sensor, width, height, hmirror=True, vflip=True, chn=2):
+    """Reset sensor and configure resolution / pixel format (OV5647, default chn=2)."""
     sensor.reset()
     try:
         sensor.set_hmirror(hmirror)
@@ -316,11 +302,12 @@ def camera_configure(sensor, width, height, hmirror=True, vflip=True, chn=1):
         sensor.set_vflip(vflip)
     except Exception:
         pass
-    if chn == 1:
-        sensor.set_framesize(Sensor.FHD)
-        sensor.set_pixformat(Sensor.YUV420SP)
-        sensor.set_framesize(width=width, height=height, chn=1)
-        sensor.set_pixformat(Sensor.RGB565, chn=1)
+    if chn in (1, 2):
+        # ISP 输出通道：chn=0 作为 sensor 基础输出，chn=1/2 为缩放 RGB 输出
+        sensor.set_framesize(width=width, height=height)
+        sensor.set_pixformat(Sensor.RGB565)
+        sensor.set_framesize(width=width, height=height, chn=chn)
+        sensor.set_pixformat(Sensor.RGB565, chn=chn)
     else:
         sensor.set_framesize(width=width, height=height)
         sensor.set_pixformat(Sensor.RGB565)
@@ -347,19 +334,24 @@ def camera_start(sensor, camera_id=2, width=400, height=300,
     """Start sensor stream with auto-retry.  Sets module-level ``_ACTIVE_CHN``."""
     global _ACTIVE_CHN
 
-    channels = (1, 0) if allow_fallback else (1,)
+    # 板载 OV5647 默认使用 chn=2（ISP 输出），回退到 chn=1、chn=0
+    channels = (2, 1, 0) if allow_fallback else (2,)
 
     last_error = None
     for chn in channels:
-        try:
-            camera_configure(sensor, width, height, hmirror, vflip, chn=chn)
-        except Exception:
-            pass
-
         for attempt in range(retry_count):
             os.exitpoint()
             try:
+                # 1. 先初始化媒体管理器
                 MediaManager.init()
+                
+                # 2. 【核心修改】将配置移动到这里！确保在 MediaManager.init() 之后执行 sensor.reset()
+                try:
+                    camera_configure(sensor, width, height, hmirror, vflip, chn=chn)
+                except Exception as ce:
+                    print("[Sensor] config failed inside loop:", ce)
+
+                # 3. 此时状态正确，可以安全启动
                 sensor.run()
                 _settle = settle_ms + attempt * settle_step_ms
                 time.sleep_ms(_settle)
@@ -395,9 +387,17 @@ def camera_start(sensor, camera_id=2, width=400, height=300,
 
 
 def _snap(sensor, chn):
-    if chn == 1:
-        return sensor.snapshot(chn=1)
-    return sensor.snapshot(chn=0)
+    # 使用活跃通道，失败依次回退 chn=2 → chn=1 → chn=0
+    fallback_order = [c for c in (2, 1, 0) if c != chn]
+    try:
+        return sensor.snapshot(chn=chn)
+    except Exception:
+        for fb in fallback_order:
+            try:
+                return sensor.snapshot(chn=fb)
+            except Exception:
+                pass
+        return sensor.snapshot()
 
 
 def camera_snapshot(sensor, retry_count=3, retry_delay_ms=3):
@@ -441,7 +441,6 @@ def camera_restart(sensor, camera_id=2, width=400, height=300,
 
 
 def camera_deinit(sensor):
-    """Stop sensor and tear down media/display."""
     try:
         if sensor is not None:
             sensor.stop()
@@ -468,7 +467,6 @@ def camera_deinit(sensor):
 # ═══════════════════════════════════════════════════════════════
 
 def display_init(width=400, height=300, use_st7701_fallback=True):
-    """Initialise preview display: VIRT (IDE) first, then ST7701 LCD."""
     try:
         Display.init(Display.VIRT, width=width, height=height,
                      fps=100, to_ide=True)
@@ -483,6 +481,5 @@ def display_init(width=400, height=300, use_st7701_fallback=True):
 
 
 def display_init_board():
-    """Initialise ST7701 LCD (used by calibrate)."""
     Display.init(Display.ST7701, to_ide=True)
     print("[Display] ST7701 key preview")

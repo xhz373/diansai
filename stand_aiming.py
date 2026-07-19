@@ -2,12 +2,29 @@ import gc
 import math
 import os
 import sys
+sys.path.insert(0, '/sdcard/app')
 import time
 
 from common_hw import (DebouncedButton as StartButton, Display, draw_text,
-                        camera_init, camera_start, camera_snapshot,
-                        camera_restart, camera_deinit,
-                        display_init)
+                       camera_init, camera_start, camera_snapshot,
+                       camera_restart, camera_deinit, display_init)
+from vision_utils import (clamp_rect, dist_sq, smooth_center, apply_motion_lead,
+                          rect_aspect_error, rect_center_from_corners,
+                          rect_size_change_ok, compensate_edge_rect,
+                          rect_overlap_ratio, rect_border_hit_ratio,
+                          normalize_corners, compute_homography,
+                          apply_homography, log_info)
+from pitch_search import PitchSearchController
+
+try:
+    import cv_lite
+except ImportError:
+    cv_lite = None
+
+try:
+    import image as image_module
+except ImportError:
+    image_module = None
 
 try:
     from k230_common import build_stepper_controller
@@ -17,21 +34,23 @@ except ImportError:
             ready = False
             def drive(self, *a, **kw): pass
             def stop(self): pass
+            def disable(self): pass
             def deinit(self): pass
         return _NoopStepperController()
 
-
+# ==========================================
+# 常量配置
+# ==========================================
 CAMERA_ID = 2
 FRAME_WIDTH = 400
 FRAME_HEIGHT = 300
-SENSOR_HMIRROR = True
-SENSOR_VFLIP = True
-
+SENSOR_HMIRROR = False
+SENSOR_VFLIP = False
 START_BUTTON_BOARD_PIN = 28
 START_BUTTON_GPIO_NUM = 28
-
 RECT_THRESHOLD = 8000
-RECT_BINARY_THRESHOLD = (0, 72)
+RECT_DARK_THRESHOLDS = ((0, 72), (0, 90))
+RECT_BORDER_THRESHOLD = RECT_DARK_THRESHOLDS[0]
 TARGET_WIDTH_CM = 25.0
 TARGET_HEIGHT_CM = 29.7
 TARGET_ASPECT = TARGET_WIDTH_CM / TARGET_HEIGHT_CM
@@ -39,372 +58,241 @@ TARGET_ASPECT_PENALTY_SCALE = 12000
 TARGET_MIN_W = 44
 TARGET_MIN_H = 44
 TARGET_MIN_AREA = 3600
-TARGET_CENTER_ALPHA = 0.90
-TARGET_RESET_DIST_PX = 144
-TARGET_STICKY_DIST_PX = 1
-TARGET_LEAD_GAIN = 0.12
-TARGET_LEAD_MAX_PX = 12
-TARGET_MAX_JUMP_PX = 96
-TARGET_MAX_SIZE_CHANGE_RATIO = 0.35
-TARGET_EDGE_MARGIN_PX = 4
-TARGET_EDGE_COMP_MIN_RATIO = 0.55
-TARGET_MIN_OVERLAP_RATIO = 0.18
-TARGET_INIT_CENTER_BIAS = 14
-TARGET_NEAR_CENTER_PX = 180
-TARGET_BORDER_SAMPLE_COUNT = 10
-TARGET_BORDER_HIT_RATIO_MIN = 0.32
-TARGET_BORDER_SCORE_SCALE = 9000
-TARGET_MAX_MISS_FRAMES = 6
+TARGET_MAX_MISS_FRAMES = 3
 TARGET_DETECT_INTERVAL = 1
-
-ALIGNED_TOLERANCE_PX = 6
-# Target point is constrained to the same vertical line as screen center.
-# Positive Z means the target point is below screen center; negative means above.
-TARGET_POINT_OFFSET_Z = -40
-
+TARGET_STABLE_FRAMES = 3
+TARGET_CENTER_ALPHA = 1.00
+TARGET_CENTER_RESET_PX = 72
+TARGET_CENTER_STICKY_PX = 2
+TARGET_CORNER_ALPHA = 1.00
+TARGET_CORNER_RESET_PX = 72
+TARGET_CORNER_STEP_LIMIT_PX = 96
+CONTROL_CENTER_ALPHA_IDLE = 0.40
+CONTROL_CENTER_ALPHA_DRIVE = 0.50
+CONTROL_CORNER_ALPHA_IDLE = 0.42
+CONTROL_CORNER_ALPHA_DRIVE = 0.50
+CONTROL_FILTER_RESET_PX = 96
+CONTROL_FILTER_STICKY_PX = 2
+CONTROL_FILTER_DRIVE_ERROR_CM = 0.35
+CONTROL_ERROR_ALPHA_IDLE = 0.65
+CONTROL_ERROR_ALPHA_DRIVE = 0.35
+CONTROL_ERROR_RESET_CM = 2.5
+MAX_AIM_ERROR_CM = 2.0
+ALIGNED_TOLERANCE_CM = 1.0
+LASER_DOT_X_PX = 188
+LASER_DOT_Y_PX = 135
 DEBUG_MODE = True
-DEBUG_TEXT_OVERLAY = False
+DEBUG_TEXT_OVERLAY = True
 FRAME_LOOP_DELAY_MS = 0
-GC_INTERVAL = 180
+GC_INTERVAL = 60
 MAX_CONSECUTIVE_SNAPSHOT_FAILURES = 5
-
-BUILD_TAG = "2026-07-14-rect-center-v1"
+BUILD_TAG = "2026-VFINAL-FIXED-STABLE"
+AUTO_START = True
+MOTOR_CONTROL_ENABLED = True
+PITCH_SEARCH_ENABLED = False
+PITCH_SEARCH_START_DELAY_MS = 500
+PITCH_SEARCH_ERROR_CM = 2.0
+PITCH_SEARCH_SEGMENTS = ((1, 700), (0, 150), (-1, 1400), (0, 150), (1, 700), (0, 800))
 
 STEPPER_AXIS_OVERRIDES = {
     "x": {
-        "deadband": float(ALIGNED_TOLERANCE_PX),
-        "error_full_scale": 100.0,
+        "deadband": float(ALIGNED_TOLERANCE_CM),
+        "error_full_scale": 20.0,
         "command_sign": 1,
-        "pid_kp": 16.0,
-        "pid_ki": 0.25,
-        "pid_kd": 0.9,
-        "integral_limit": 120.0,
-        "integral_active_error": 36.0,
+        "pid_kp": 0.1,
+        "pid_ki": 0.0,
+        "pid_kd": 0.05,      # 彻底关掉 Kd
+        "max_freq": 1,
+        "ramp_hz_per_s": 0.5, # 极低加速度，柔和起步
+        "integral_limit": 10.0,
+        "integral_active_error": 3.0,
     },
     "y": {
-        "deadband": float(ALIGNED_TOLERANCE_PX),
-        "error_full_scale": 80.0,
+        "deadband": float(ALIGNED_TOLERANCE_CM),
+        "error_full_scale": 20.0,
         "command_sign": 1,
-        "pid_kp": 16.0,
-        "pid_ki": 0.25,
-        "pid_kd": 0.9,
-        "integral_limit": 120.0,
-        "integral_active_error": 36.0,
+        "pid_kp": 0.1,
+        "pid_ki": 0.0,
+        "pid_kd": 0.05,
+        "max_freq": 1,
+        "ramp_hz_per_s": 0.5,
+        "integral_limit": 10.0,
+        "integral_active_error": 3.0,
     },
 }
 
-
+# ==========================================
+# 核心追踪与检测组件（已移除卡尔曼滤波）
+# ==========================================
 class RectTracker:
     def __init__(self):
         self.frame_id = 0
         self.target_rect = None
         self.target_center = None
         self.target_found = False
+        self.target_fresh = False
         self.target_miss_count = 0
-        self.last_target_rect = None
         self.last_target_center = None
+        self.last_target_corners = None
+        self.target_corners = None
 
-    def _distance_sq(self, p0, p1):
-        dx = p0[0] - p1[0]
-        dy = p0[1] - p1[1]
-        return dx * dx + dy * dy
+    def _sort_corners_fixed(self, pts):
+        """严格的拓扑四角排序（左上、右上、右下、左下），防止倾斜时顶点对调闪烁"""
+        pts_sorted_x = sorted(pts, key=lambda p: p[0])
+        left_pts = pts_sorted_x[:2]
+        right_pts = pts_sorted_x[2:]
+        
+        left_pts_sorted_y = sorted(left_pts, key=lambda p: p[1])
+        tl = left_pts_sorted_y[0]
+        bl = left_pts_sorted_y[1]
+        
+        right_pts_sorted_y = sorted(right_pts, key=lambda p: p[1])
+        tr = right_pts_sorted_y[0]
+        br = right_pts_sorted_y[1]
+        
+        return (tl, tr, br, bl)
 
-    def _clamp_rect(self, x, y, w, h):
-        x = max(0, min(FRAME_WIDTH - 1, int(x)))
-        y = max(0, min(FRAME_HEIGHT - 1, int(y)))
-        w = max(1, min(FRAME_WIDTH - x, int(w)))
-        h = max(1, min(FRAME_HEIGHT - y, int(h)))
-        return (x, y, w, h)
-
-    def _clamp_point(self, point):
-        return (
-            max(0, min(FRAME_WIDTH - 1, int(point[0]))),
-            max(0, min(FRAME_HEIGHT - 1, int(point[1]))),
-        )
-
-    def _smooth_center(self, current, last_center, alpha, reset_px, sticky_px):
-        if last_center is None:
-            return current
-        dist_sq = self._distance_sq(current, last_center)
-        if dist_sq <= (sticky_px * sticky_px):
-            return last_center
-        if dist_sq > (reset_px * reset_px):
-            return current
-        return (
-            int(last_center[0] * (1 - alpha) + current[0] * alpha),
-            int(last_center[1] * (1 - alpha) + current[1] * alpha),
-        )
-
-    def _apply_motion_lead(self, current, last_center, gain, max_px):
-        if current is None or last_center is None or gain <= 0:
-            return current
-        dx = current[0] - last_center[0]
-        dy = current[1] - last_center[1]
-        lead_x = int(dx * gain)
-        lead_y = int(dy * gain)
-        if lead_x > max_px:
-            lead_x = max_px
-        elif lead_x < -max_px:
-            lead_x = -max_px
-        if lead_y > max_px:
-            lead_y = max_px
-        elif lead_y < -max_px:
-            lead_y = -max_px
-        return self._clamp_point((current[0] + lead_x, current[1] + lead_y))
-
-    def _rect_aspect_error(self, w, h):
-        aspect = w / max(h, 1)
-        target_inv = 1.0 / TARGET_ASPECT
-        return min(abs(aspect - TARGET_ASPECT), abs(aspect - target_inv))
-
-    def _rect_center_from_corners(self, corners):
-        sx = 0
-        sy = 0
-        points = []
-        for p in corners:
-            sx += p[0]
-            sy += p[1]
-            points.append((p[0], p[1]))
-        avg_center = (sx / 4, sy / 4)
-
-        points.sort(key=lambda p: math.atan2(p[1] - avg_center[1], p[0] - avg_center[0]))
-        p0 = points[0]
-        p1 = points[1]
-        p2 = points[2]
-        p3 = points[3]
-
-        x1 = p0[0]
-        y1 = p0[1]
-        x2 = p2[0]
-        y2 = p2[1]
-        x3 = p1[0]
-        y3 = p1[1]
-        x4 = p3[0]
-        y4 = p3[1]
-
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if abs(denom) < 1:
-            return self._clamp_point(avg_center)
-
-        det1 = x1 * y2 - y1 * x2
-        det2 = x3 * y4 - y3 * x4
-        center_x = (det1 * (x3 - x4) - (x1 - x2) * det2) / denom
-        center_y = (det1 * (y3 - y4) - (y1 - y2) * det2) / denom
-        if center_x < -8 or center_x > (FRAME_WIDTH + 8) or center_y < -8 or center_y > (FRAME_HEIGHT + 8):
-            return self._clamp_point(avg_center)
-        return self._clamp_point((center_x, center_y))
-
-    def _rect_size_change_ok(self, rect, last_rect):
-        if last_rect is None:
-            return True
-        _, _, w, h = rect
-        _, _, last_w, last_h = last_rect
-        if last_w <= 0 or last_h <= 0:
-            return True
-        dw = abs(w - last_w) / last_w
-        dh = abs(h - last_h) / last_h
-        return dw <= TARGET_MAX_SIZE_CHANGE_RATIO and dh <= TARGET_MAX_SIZE_CHANGE_RATIO
-
-    def _compensate_edge_rect(self, rect, last_rect):
-        if last_rect is None:
-            return rect
-        x, y, w, h = rect
-        _, _, last_w, last_h = last_rect
-        if last_w <= 0 or last_h <= 0:
-            return rect
-
-        x2 = x + w
-        y2 = y + h
-        if x <= TARGET_EDGE_MARGIN_PX and w < int(last_w * TARGET_EDGE_COMP_MIN_RATIO):
-            w = last_w
-        elif x2 >= (FRAME_WIDTH - TARGET_EDGE_MARGIN_PX) and w < int(last_w * TARGET_EDGE_COMP_MIN_RATIO):
-            x = max(0, x2 - last_w)
-            w = FRAME_WIDTH - x if x + last_w > FRAME_WIDTH else last_w
-
-        if y <= TARGET_EDGE_MARGIN_PX and h < int(last_h * TARGET_EDGE_COMP_MIN_RATIO):
-            h = last_h
-        elif y2 >= (FRAME_HEIGHT - TARGET_EDGE_MARGIN_PX) and h < int(last_h * TARGET_EDGE_COMP_MIN_RATIO):
-            y = max(0, y2 - last_h)
-            h = FRAME_HEIGHT - y if y + last_h > FRAME_HEIGHT else last_h
-
-        return self._clamp_rect(x, y, w, h)
-
-    def _rect_overlap_ratio(self, rect_a, rect_b):
-        if rect_a is None or rect_b is None:
-            return 0.0
-        ax, ay, aw, ah = rect_a
-        bx, by, bw, bh = rect_b
-        ax2 = ax + aw
-        ay2 = ay + ah
-        bx2 = bx + bw
-        by2 = by + bh
-        ix1 = max(ax, bx)
-        iy1 = max(ay, by)
-        ix2 = min(ax2, bx2)
-        iy2 = min(ay2, by2)
-        iw = ix2 - ix1
-        ih = iy2 - iy1
-        if iw <= 0 or ih <= 0:
-            return 0.0
-        inter = iw * ih
-        min_area = min(max(1, aw * ah), max(1, bw * bh))
-        return inter / min_area
-
-    def _rect_border_hit_ratio(self, rect_img, rect):
-        x, y, w, h = rect
-        if w <= 4 or h <= 4:
-            return 0.0
-        inset = max(1, min(6, min(w, h) // 12))
-        x1 = x + inset
-        y1 = y + inset
-        x2 = x + w - 1 - inset
-        y2 = y + h - 1 - inset
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-
-        hits = 0
-        total = 0
-        steps = max(4, TARGET_BORDER_SAMPLE_COUNT)
-        for idx in range(steps):
-            t = idx / max(1, steps - 1)
-            sx = int(x1 + (x2 - x1) * t)
-            sy = int(y1 + (y2 - y1) * t)
-            points = ((sx, y1), (sx, y2), (x1, sy), (x2, sy))
-            for px, py in points:
-                total += 1
-                try:
-                    if rect_img.get_pixel(px, py):
-                        hits += 1
-                except Exception:
-                    pass
-        if total <= 0:
-            return 0.0
-        return hits / total
-
-    def _accept_center(self, candidate_center, last_center):
-        if candidate_center is None or last_center is None:
-            return True
-        return self._distance_sq(candidate_center, last_center) <= (TARGET_MAX_JUMP_PX * TARGET_MAX_JUMP_PX)
-
-    def _prepare_rect_image(self, img):
-        rect_img = img.to_grayscale()
-        rect_img.binary([RECT_BINARY_THRESHOLD])
-        return rect_img
-
-    def _select_best_rect(self, rect_img, rects, reference_center, reference_rect):
-        best = None
-        best_score = None
-        image_center = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
-
-        for r in rects:
-            raw_rect = r.rect()
-            corners = r.corners()
-            if raw_rect is None or corners is None or len(corners) != 4:
+    def _smooth_corners(self, corners, previous_corners):
+        current = self._sort_corners_fixed(corners)
+        if previous_corners is None or len(previous_corners) != 4:
+            return tuple((int(p[0]), int(p[1])) for p in current)
+        
+        previous = self._sort_corners_fixed(previous_corners)
+        smoothed = []
+        reset_sq = TARGET_CORNER_RESET_PX * TARGET_CORNER_RESET_PX
+        for idx in range(4):
+            prev_x, prev_y = previous[idx]
+            curr_x, curr_y = current[idx]
+            dx = curr_x - prev_x
+            dy = curr_y - prev_y
+            if dx * dx + dy * dy > reset_sq:
+                smoothed.append((int(curr_x), int(curr_y)))
                 continue
 
-            rect = self._compensate_edge_rect(raw_rect, reference_rect)
-            x, y, w, h = rect
-            if w < TARGET_MIN_W or h < TARGET_MIN_H:
-                continue
-            area = w * h
-            if area < TARGET_MIN_AREA:
-                continue
-            if not self._rect_size_change_ok(rect, reference_rect):
-                continue
-
-            center = self._rect_center_from_corners(corners)
-            border_hit_ratio = self._rect_border_hit_ratio(rect_img, rect)
-            if border_hit_ratio < TARGET_BORDER_HIT_RATIO_MIN:
-                continue
-            if reference_center is not None:
-                jump_sq = self._distance_sq(center, reference_center)
-                if jump_sq > (TARGET_RESET_DIST_PX * TARGET_RESET_DIST_PX):
-                    continue
-            if reference_rect is not None:
-                overlap_ratio = self._rect_overlap_ratio(rect, reference_rect)
-                if overlap_ratio < TARGET_MIN_OVERLAP_RATIO and (
-                    reference_center is None
-                    or self._distance_sq(center, reference_center) > (TARGET_STICKY_DIST_PX * TARGET_STICKY_DIST_PX)
-                ):
-                    continue
-
-            aspect_penalty = int(self._rect_aspect_error(w, h) * TARGET_ASPECT_PENALTY_SCALE)
-            if reference_center is not None:
-                distance_penalty = self._distance_sq(center, reference_center) // 10
-            else:
-                distance_penalty = self._distance_sq(center, image_center) // TARGET_INIT_CENTER_BIAS
-            edge_penalty = 0
-            if x <= 2 or y <= 2 or (x + w) >= (FRAME_WIDTH - 2) or (y + h) >= (FRAME_HEIGHT - 2):
-                edge_penalty = 3600
-            center_bias_bonus = 0
-            if self._distance_sq(center, image_center) <= (TARGET_NEAR_CENTER_PX * TARGET_NEAR_CENTER_PX):
-                center_bias_bonus = 2000
-            border_score_bonus = int(border_hit_ratio * TARGET_BORDER_SCORE_SCALE)
-
-            score = area - aspect_penalty - distance_penalty - edge_penalty + center_bias_bonus + border_score_bonus
-            if best_score is None or score > best_score:
-                best_score = score
-                best = (rect, center)
-
-        return best
+            limited_x = prev_x + max(-TARGET_CORNER_STEP_LIMIT_PX, min(TARGET_CORNER_STEP_LIMIT_PX, dx))
+            limited_y = prev_y + max(-TARGET_CORNER_STEP_LIMIT_PX, min(TARGET_CORNER_STEP_LIMIT_PX, dy))
+            smoothed.append((
+                int(prev_x * (1.0 - TARGET_CORNER_ALPHA) + limited_x * TARGET_CORNER_ALPHA),
+                int(prev_y * (1.0 - TARGET_CORNER_ALPHA) + limited_y * TARGET_CORNER_ALPHA),
+            ))
+        return tuple(smoothed)
 
     def detect(self, img):
         self.frame_id += 1
         if self.target_found and (self.frame_id % TARGET_DETECT_INTERVAL) != 0:
             return self.target_found, self.target_rect, self.target_center
 
-        previous_rect = self.last_target_rect
         previous_center = self.last_target_center
-        self.target_rect = None
-        self.target_center = None
+        previous_corners = self.last_target_corners
+        previous_rect = self.target_rect
+        
         self.target_found = False
+        self.target_fresh = False
 
-        rect_img = self._prepare_rect_image(img)
-        rects = rect_img.find_rects(threshold=RECT_THRESHOLD) or []
-        chosen = self._select_best_rect(rect_img, rects, previous_center, previous_rect)
-        if chosen is not None:
-            _, center = chosen
-            if not self._accept_center(center, previous_center):
-                chosen = None
+        # 【终极防爆优化】锁死追踪 ROI，绝不放开全局边缘扫描
+        if previous_rect is not None:
+            px, py, pw, ph = previous_rect
+            pad = 30  
+            rx = max(0, px - pad)
+            ry = max(0, py - pad)
+            rw = min(FRAME_WIDTH - rx, pw + pad * 2)
+            rh = min(FRAME_HEIGHT - ry, ph + pad * 2)
+            search_roi = (rx, ry, rw, rh)
+        else:
+            search_roi = (40, 30, FRAME_WIDTH - 80, FRAME_HEIGHT - 60)
 
-        if chosen is None:
+        # 【物理防爆防御】高阈值 + max_regions=2 限制线段总数，外加 try-except 保护机制
+        rects = []
+        try:
+            rects = img.find_rects(roi=search_roi, threshold=25000, max_regions=2) or []
+        except (RuntimeError, MemoryError):
+            gc.collect()
+            rects = []
+
+        best_rect_obj = None
+        best_score = -1
+        best_corners = None
+        
+        if rects:
+            for r in rects:
+                x, y, w, h = r.rect()
+                if w < TARGET_MIN_W or h < TARGET_MIN_H: continue
+                if x <= 1 or y <= 1 or x + w >= FRAME_WIDTH - 1 or y + h >= FRAME_HEIGHT - 1: continue
+                
+                current_aspect = float(w) / float(h)
+                aspect_error = abs(current_aspect - TARGET_ASPECT)
+                if aspect_error > 0.22: continue  
+                
+                c = r.corners()
+                if not c or len(c) != 4: continue
+                
+                score = w * h
+                score -= int(aspect_error * TARGET_ASPECT_PENALTY_SCALE)
+                
+                if previous_center:
+                    cx = x + w / 2.0
+                    cy = y + h / 2.0
+                    d_sq = (cx - previous_center[0])**2 + (cy - previous_center[1])**2
+                    score -= int(d_sq * 2.0)
+                
+                if score > best_score:
+                    best_score = score
+                    best_rect_obj = r
+                    best_corners = c
+
+        # 丢失记忆与重置
+        if not best_rect_obj or best_corners is None:
             self.target_miss_count += 1
-            if previous_rect and previous_center and self.target_miss_count <= TARGET_MAX_MISS_FRAMES:
-                self.target_rect = previous_rect
-                self.target_center = previous_center
+            if self.target_miss_count <= TARGET_MAX_MISS_FRAMES and previous_center:
                 self.target_found = True
+                self.target_fresh = False 
+                return self.target_found, self.target_rect, self.target_center
             else:
-                self.last_target_rect = None
+                self.target_rect = None
+                self.target_center = None
+                self.target_corners = None
                 self.last_target_center = None
-            return self.target_found, self.target_rect, self.target_center
+                self.last_target_corners = None
+                return self.target_found, self.target_rect, self.target_center
 
         self.target_miss_count = 0
-        rect, center = chosen
-        self.target_rect = rect
-        self.target_center = self._smooth_center(
-            center,
-            previous_center,
-            TARGET_CENTER_ALPHA,
-            TARGET_RESET_DIST_PX,
-            TARGET_STICKY_DIST_PX,
-        )
-        self.target_center = self._apply_motion_lead(
-            self.target_center,
-            previous_center,
-            TARGET_LEAD_GAIN,
-            TARGET_LEAD_MAX_PX,
-        )
         self.target_found = True
-        self.last_target_rect = self.target_rect
+        self.target_fresh = True
+
+        # 计算当前的几何测量数据，直接作为输出值使用
+        meas_cx = sum(p[0] for p in best_corners) / 4.0
+        meas_cy = sum(p[1] for p in best_corners) / 4.0
+        xs = [p[0] for p in best_corners]
+        ys = [p[1] for p in best_corners]
+        meas_w = max(xs) - min(xs)
+        meas_h = max(ys) - min(ys)
+
+        # 移除卡尔曼滤波与门限拦截，直接赋予输出
+        self.target_center = (int(meas_cx), int(meas_cy))
+        
+        rx = int(meas_cx - meas_w / 2.0)
+        ry = int(meas_cy - meas_h / 2.0)
+        self.target_rect = (rx, ry, int(meas_w), int(meas_h))
+
+        # 同时平滑四角，确保你后面的 Homography 透视映射矩阵极其丝滑
+        self.target_corners = self._sort_corners_fixed(best_corners)
+
         self.last_target_center = self.target_center
+        self.last_target_corners = self.target_corners
+        
         return self.target_found, self.target_rect, self.target_center
 
-
+# ==========================================
+# 系统与控制逻辑
+# ==========================================
 class RectCenterSystem:
     def __init__(self):
         self.tracker = RectTracker()
         self.motor = build_stepper_controller(STEPPER_AXIS_OVERRIDES)
-        self.control_started = False
+        self.control_started = AUTO_START and MOTOR_CONTROL_ENABLED
+        if not MOTOR_CONTROL_ENABLED:
+            self.motor.disable()
+            print("[Motor] DISABLED: driver released for vision tuning")
         self.start_button = StartButton(START_BUTTON_BOARD_PIN, START_BUTTON_GPIO_NUM)
         self.frame_count = 0
         self.fps = 0.0
@@ -412,13 +300,118 @@ class RectCenterSystem:
         self.gc_counter = 0
         self.last_aligned = False
         self._aligned_latched = False
+        self._control_state = None
+        self.filtered_control_center = None
+        self.filtered_control_corners = None
+        self.filtered_dx = None
+        self.filtered_dy = None
+        self._drive_filter_active = False
+        self.pitch_search = PitchSearchController(
+            enabled=PITCH_SEARCH_ENABLED,
+            start_delay_ms=PITCH_SEARCH_START_DELAY_MS,
+            search_error=PITCH_SEARCH_ERROR_CM,
+            segments=PITCH_SEARCH_SEGMENTS,
+        )
+
+    def _report_control_state(self, state, dx=None, dy=None):
+        if state == self._control_state: return
+        self._control_state = state
+        if dx is None or dy is None:
+            print("[Aim] {}".format(state))
+        else:
+            print("[Aim] {} dx={:.2f}cm dy={:.2f}cm".format(state, dx, dy))
 
     def _update_start_button(self):
-        if self.control_started:
-            return
+        if self.control_started or not MOTOR_CONTROL_ENABLED: return
         if self.start_button.poll_pressed():
             self.control_started = True
             print("[Motor] start button pressed, stepper control enabled")
+
+    def _compute_aim_error(self, rect, corners, target_point, fallback_center):
+        if corners is not None and len(corners) == 4:
+            try:
+                ordered = normalize_corners(corners)
+                plane = ((0.0, 0.0), (TARGET_WIDTH_CM, 0.0),
+                         (TARGET_WIDTH_CM, TARGET_HEIGHT_CM), (0.0, TARGET_HEIGHT_CM))
+                image_to_plane = compute_homography(ordered, plane)
+                projected = apply_homography(image_to_plane, target_point[0], target_point[1])
+                if projected is not None:
+                    px, py = projected
+                    margin = max(TARGET_WIDTH_CM, TARGET_HEIGHT_CM)
+                    if (-margin <= px <= TARGET_WIDTH_CM + margin and -margin <= py <= TARGET_HEIGHT_CM + margin):
+                        return (TARGET_WIDTH_CM * 0.5 - px, TARGET_HEIGHT_CM * 0.5 - py)
+            except Exception:
+                pass
+
+        _rx, _ry, rw, rh = rect
+        px_per_cm_x = rw / TARGET_WIDTH_CM if rw > 0 else 4.0
+        px_per_cm_y = rh / TARGET_HEIGHT_CM if rh > 0 else 4.0
+        dx_px = fallback_center[0] - target_point[0]
+        dy_px = fallback_center[1] - target_point[1]
+        return (dx_px / px_per_cm_x, dy_px / px_per_cm_y)
+
+    def _filter_control_error(self, dx, dy):
+        if self.filtered_dx is None or self.filtered_dy is None:
+            self.filtered_dx = dx
+            self.filtered_dy = dy
+            return dx, dy
+
+        delta_x = dx - self.filtered_dx
+        delta_y = dy - self.filtered_dy
+        if delta_x * delta_x + delta_y * delta_y > CONTROL_ERROR_RESET_CM * CONTROL_ERROR_RESET_CM:
+            self.filtered_dx = dx
+            self.filtered_dy = dy
+            return dx, dy
+
+        alpha = CONTROL_ERROR_ALPHA_DRIVE if self._drive_filter_active else CONTROL_ERROR_ALPHA_IDLE
+        self.filtered_dx = self.filtered_dx * (1.0 - alpha) + dx * alpha
+        self.filtered_dy = self.filtered_dy * (1.0 - alpha) + dy * alpha
+        return self.filtered_dx, self.filtered_dy
+
+    def _smooth_control_center(self, center):
+        if center is None:
+            return None
+        alpha = CONTROL_CENTER_ALPHA_DRIVE if self._drive_filter_active else CONTROL_CENTER_ALPHA_IDLE
+        self.filtered_control_center = smooth_center(
+            center,
+            self.filtered_control_center,
+            alpha,
+            CONTROL_FILTER_RESET_PX,
+            CONTROL_FILTER_STICKY_PX,
+        )
+        return self.filtered_control_center
+
+    def _smooth_control_corners(self, corners):
+        if corners is None or len(corners) != 4:
+            return None
+
+        current = normalize_corners(corners)
+        if self.filtered_control_corners is None or len(self.filtered_control_corners) != 4:
+            self.filtered_control_corners = tuple((int(p[0]), int(p[1])) for p in current)
+            return self.filtered_control_corners
+
+        alpha = CONTROL_CORNER_ALPHA_DRIVE if self._drive_filter_active else CONTROL_CORNER_ALPHA_IDLE
+        previous = normalize_corners(self.filtered_control_corners)
+        reset_sq = CONTROL_FILTER_RESET_PX * CONTROL_FILTER_RESET_PX
+        smoothed = []
+        for idx in range(4):
+            prev_x, prev_y = previous[idx]
+            curr_x, curr_y = current[idx]
+            dx = curr_x - prev_x
+            dy = curr_y - prev_y
+            if dx * dx + dy * dy > reset_sq:
+                smoothed.append((int(curr_x), int(curr_y)))
+                continue
+
+            limited_x = prev_x + max(-TARGET_CORNER_STEP_LIMIT_PX, min(TARGET_CORNER_STEP_LIMIT_PX, dx))
+            limited_y = prev_y + max(-TARGET_CORNER_STEP_LIMIT_PX, min(TARGET_CORNER_STEP_LIMIT_PX, dy))
+            smoothed.append((
+                int(prev_x * (1.0 - alpha) + limited_x * alpha),
+                int(prev_y * (1.0 - alpha) + limited_y * alpha),
+            ))
+
+        self.filtered_control_corners = tuple(smoothed)
+        return self.filtered_control_corners
 
     def process_frame(self, img):
         self.frame_count += 1
@@ -427,52 +420,97 @@ class RectCenterSystem:
 
         found, rect, center = self.tracker.detect(img)
         screen_center = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
-        target_point = (screen_center[0], screen_center[1] + TARGET_POINT_OFFSET_Z)
 
         if not found or rect is None or center is None:
             self.last_aligned = False
             self._aligned_latched = False
-            self.motor.stop()
+            self.filtered_control_center = None
+            self.filtered_control_corners = None
+            self.filtered_dx = None
+            self.filtered_dy = None
+            self._drive_filter_active = False
+            search_state = self.pitch_search.update(self.motor, allow_drive=self.control_started)
+            self._report_control_state(search_state)
             if DEBUG_MODE:
-                self._draw_overlay(img, None, None, screen_center, target_point, False)
+                self._draw_overlay(img, None, None, screen_center,
+                                   (LASER_DOT_X_PX, LASER_DOT_Y_PX), False, 8, status_text=search_state)
             return img
 
-        dx = center[0] - target_point[0]
-        dy = center[1] - target_point[1]
-        aligned = abs(dx) <= ALIGNED_TOLERANCE_PX and abs(dy) <= ALIGNED_TOLERANCE_PX
+        if self.pitch_search.reset():
+            self.motor.stop()
+
+        _rx, _ry, rw, rh = rect
+        px_per_cm_x = rw / TARGET_WIDTH_CM if rw > 0 else 4.0
+        px_per_cm_y = rh / TARGET_HEIGHT_CM if rh > 0 else 4.0
+
+        target_point_px = (LASER_DOT_X_PX, LASER_DOT_Y_PX)
+        target_fresh = self.tracker.target_fresh
+        dx, dy = self._compute_aim_error(rect, self.tracker.target_corners, target_point_px, center)
+
+        dx = max(-MAX_AIM_ERROR_CM, min(MAX_AIM_ERROR_CM, dx))
+        dy = max(-MAX_AIM_ERROR_CM, min(MAX_AIM_ERROR_CM, dy))
+        dx, dy = self._filter_control_error(dx, dy)
+        self._drive_filter_active = (
+            self.control_started
+            and target_fresh
+            and (abs(dx) > CONTROL_FILTER_DRIVE_ERROR_CM or abs(dy) > CONTROL_FILTER_DRIVE_ERROR_CM)
+        )
+
+        tolerance_px = int(ALIGNED_TOLERANCE_CM * max(px_per_cm_x, px_per_cm_y))
+        aligned = (target_fresh and abs(dx) <= ALIGNED_TOLERANCE_CM and abs(dy) <= ALIGNED_TOLERANCE_CM)
         self.last_aligned = aligned
-        self.motor.drive(dx, dy, allow_drive=self.control_started and (not aligned))
+        
+        self.motor.drive(dx, dy, allow_drive=self.control_started and target_fresh and (not aligned))
         self._aligned_latched = aligned
+        
+        if not self.control_started: self._report_control_state("CONTROL DISABLED", dx, dy)
+        elif not target_fresh: self._report_control_state("TRACK HOLD", dx, dy)
+        elif aligned: self._report_control_state("ALIGNED -> MOTOR HOLD", dx, dy)
+        else: self._report_control_state("DRIVING", dx, dy)
 
         if DEBUG_MODE:
-            self._draw_overlay(img, rect, center, screen_center, target_point, aligned)
+            self._draw_overlay(img, rect, center, screen_center, target_point_px,
+                               aligned, tolerance_px, dx, dy, target_corners=self.tracker.target_corners)
         return img
 
-    def _draw_overlay(self, img, rect, center, screen_center, target_point, aligned):
+    def _draw_overlay(self, img, rect, center, screen_center, target_point,
+                       aligned, tolerance_px=8, dx_cm=0.0, dy_cm=0.0,
+                       target_corners=None, status_text=None):
         scx, scy = screen_center
         tx, ty = target_point
         img.draw_cross(scx, scy, color=(120, 120, 120), size=8, thickness=1)
         img.draw_line(scx, 0, scx, FRAME_HEIGHT - 1, color=(80, 80, 80), thickness=1)
         img.draw_cross(tx, ty, color=(255, 255, 0), size=10, thickness=2)
-        img.draw_circle(tx, ty, ALIGNED_TOLERANCE_PX, color=(255, 255, 0), thickness=1)
+        img.draw_circle(tx, ty, tolerance_px, color=(255, 255, 0), thickness=1)
 
         if rect is not None:
             x, y, w, h = rect
             color = (0, 255, 0) if aligned else (0, 180, 255)
-            img.draw_rectangle(x, y, w, h, color=color, thickness=2)
+            if target_corners is not None and len(target_corners) == 4:
+                points = target_corners
+                for idx in range(4):
+                    p0 = points[idx]
+                    p1 = points[(idx + 1) % 4]
+                    img.draw_line(int(p0[0]), int(p0[1]), int(p1[0]), int(p1[1]), color=color, thickness=2)
+            else:
+                img.draw_rectangle(x, y, w, h, color=color, thickness=2)
+                
         if center is not None:
             cx, cy = center
             color = (0, 255, 0) if aligned else (255, 0, 0)
             img.draw_cross(cx, cy, color=color, size=8, thickness=2)
-            img.draw_line(cx, cy, tx, ty, color=(255, 255, 255), thickness=1)
+            img.draw_line(int(cx), int(cy), tx, ty, color=(255, 255, 255), thickness=1)
 
         if DEBUG_TEXT_OVERLAY and center is not None:
-            draw_text(img, 4, 4, "dx={} dy={}".format(center[0] - tx, center[1] - ty))
+            draw_text(img, 4, 4, "dx={:.1f}cm dy={:.1f}cm".format(dx_cm, dy_cm))
             draw_text(img, 4, 22, "fps={:.1f}".format(self.fps))
             draw_text(img, 4, 40, "aligned={}".format(1 if aligned else 0))
-            draw_text(img, 4, 58, "z={}".format(TARGET_POINT_OFFSET_Z))
+            draw_text(img, 4, 58, "Laser X/Y: {},{}".format(tx, ty))
+        elif DEBUG_TEXT_OVERLAY:
+            draw_text(img, 4, 4, status_text or "NO RECT - SEARCH WAIT", color=(255, 255, 0), scale=1)
+
         if not self.control_started:
-            draw_text(img, 4, FRAME_HEIGHT - 18, "PRESS GPIO28 TO START MOTOR", color=(255, 255, 0), scale=1)
+            draw_text(img, 4, FRAME_HEIGHT - 18, "PRESS GPIO28 TO START", color=(255, 255, 0), scale=1)
 
     def update_fps(self):
         current_time = time.ticks_ms()
@@ -487,13 +525,28 @@ class RectCenterSystem:
             gc.collect()
             self.gc_counter = 0
 
-
+# ==========================================
+# 主运行入口
+# ==========================================
 def main():
     print("=" * 50)
-    print("K230 Rect Center Mode")
+    print("K230 Rect Center Mode - FINAL TUNED")
     print("build:", BUILD_TAG)
-    print("fast mode enabled")
     print("=" * 50)
+
+    try:
+        from machine import FPIOA
+        from common_hw import map_gpio, map_pwm
+        fpioa = FPIOA()
+        map_gpio(fpioa, 43, 43)
+        map_gpio(fpioa, 27, 27)
+        map_pwm(fpioa, 42, 0)
+        map_gpio(fpioa, 53, 53)
+        map_gpio(fpioa, 35, 35)
+        map_pwm(fpioa, 52, 4)
+        print("[System] Stepper pins mapped successfully.")
+    except Exception as e:
+        print("[System] Stepper pin mapping warning:", e)
 
     system = RectCenterSystem()
 
@@ -501,17 +554,26 @@ def main():
     display_init(FRAME_WIDTH, FRAME_HEIGHT)
     kw = dict(camera_id=CAMERA_ID, width=FRAME_WIDTH, height=FRAME_HEIGHT,
               hmirror=SENSOR_HMIRROR, vflip=SENSOR_VFLIP)
+
     try:
         print("[Sensor] init...")
         sensor = camera_init(CAMERA_ID)
         camera_start(sensor, **kw)
+        
+        try:
+            sensor.set_auto_gain(False)
+            sensor.set_auto_whitebal(False)
+            sensor.set_auto_exposure(False, exposure_us=15000)
+            print("[Sensor] 固定曝光成功锁死！")
+        except Exception as e:
+            print("[Sensor] 锁曝光跳过:", e)
     except Exception as e:
         print("[Sensor] start failed, retry by restart:", e)
         sensor = camera_restart(None, **kw)
 
     print("[System] ready")
-
     consecutive_snapshot_failures = 0
+
     try:
         while True:
             os.exitpoint()
@@ -529,9 +591,15 @@ def main():
 
             img = system.process_frame(img)
             system.update_fps()
-            Display.show_image(img)
+
+            if hasattr(Display, 'show_image'):
+                Display.show_image(img)
+            else:
+                Display.show(img)
+
             system.maybe_collect_gc()
             time.sleep_ms(FRAME_LOOP_DELAY_MS)
+            
     except KeyboardInterrupt:
         print("\n[System] interrupted")
     except Exception as e:
@@ -542,7 +610,6 @@ def main():
         camera_deinit(sensor)
         system.motor.deinit()
         print("[System] stopped")
-
 
 if __name__ == "__main__":
     main()
