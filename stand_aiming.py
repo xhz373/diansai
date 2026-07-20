@@ -33,6 +33,7 @@ except ImportError:
         class _NoopStepperController:
             ready = False
             def drive(self, *a, **kw): pass
+            def drive_velocity(self, *a, **kw): pass
             def stop(self): pass
             def disable(self): pass
             def deinit(self): pass
@@ -51,6 +52,10 @@ START_BUTTON_GPIO_NUM = 28
 RECT_THRESHOLD = 8000
 RECT_DARK_THRESHOLDS = ((0, 72), (0, 90))
 RECT_BORDER_THRESHOLD = RECT_DARK_THRESHOLDS[0]
+RECT_TRACK_THRESHOLD = 25000
+RECT_GLOBAL_THRESHOLD = 20000
+RECT_TRACK_MAX_REGIONS = 2
+RECT_REACQUIRE_MAX_REGIONS = 4
 TARGET_WIDTH_CM = 25.0
 TARGET_HEIGHT_CM = 29.7
 TARGET_ASPECT = TARGET_WIDTH_CM / TARGET_HEIGHT_CM
@@ -59,6 +64,8 @@ TARGET_MIN_W = 44
 TARGET_MIN_H = 44
 TARGET_MIN_AREA = 3600
 TARGET_MAX_MISS_FRAMES = 3
+TARGET_REACQUIRE_FRAMES = 24
+TARGET_REACQUIRE_GLOBAL_AFTER = 4
 TARGET_DETECT_INTERVAL = 1
 TARGET_STABLE_FRAMES = 3
 TARGET_CENTER_ALPHA = 1.00
@@ -78,7 +85,7 @@ CONTROL_ERROR_ALPHA_IDLE = 0.65
 CONTROL_ERROR_ALPHA_DRIVE = 0.35
 CONTROL_ERROR_RESET_CM = 2.5
 MAX_AIM_ERROR_CM = 2.0
-ALIGNED_TOLERANCE_CM = 1.0
+ALIGNED_TOLERANCE_CM = 1.2
 LASER_DOT_X_PX = 188
 LASER_DOT_Y_PX = 135
 DEBUG_MODE = True
@@ -93,6 +100,12 @@ PITCH_SEARCH_ENABLED = False
 PITCH_SEARCH_START_DELAY_MS = 500
 PITCH_SEARCH_ERROR_CM = 2.0
 PITCH_SEARCH_SEGMENTS = ((1, 700), (0, 150), (-1, 1400), (0, 150), (1, 700), (0, 800))
+YAW_SEARCH_ENABLED = True
+YAW_SEARCH_START_DELAY_MS = 200
+YAW_SEARCH_FREQ_HZ = 150  #测试完改回300
+YAW_SEARCH_DIRECTION = -1
+YAW_SEARCH_HALF_TURN_STEPS = 1600
+YAW_SEARCH_REVERSE_PAUSE_MS = 120
 
 STEPPER_AXIS_OVERRIDES = {
     "x": {
@@ -101,21 +114,24 @@ STEPPER_AXIS_OVERRIDES = {
         "command_sign": 1,
         "pid_kp": 0.1,
         "pid_ki": 0.0,
-        "pid_kd": 0.05,      # 彻底关掉 Kd
-        "max_freq": 1,
-        "ramp_hz_per_s": 0.5, # 极低加速度，柔和起步
+        "pid_kd": 0.0,      # 彻底关掉 Kd
+        "min_freq": 80,
+        "max_freq": 200,
+        "manual_max_freq": 1000,
+        "ramp_hz_per_s": 300.0,
         "integral_limit": 10.0,
         "integral_active_error": 3.0,
     },
     "y": {
-        "deadband": float(ALIGNED_TOLERANCE_CM),
+        "deadband": float(ALIGNED_TOLERANCE_CM) * 1.35,
         "error_full_scale": 20.0,
         "command_sign": 1,
-        "pid_kp": 0.1,
+        "pid_kp": 0.07,
         "pid_ki": 0.0,
-        "pid_kd": 0.05,
-        "max_freq": 1,
-        "ramp_hz_per_s": 0.5,
+        "pid_kd": 0.0,
+        "min_freq": 60,
+        "max_freq": 180,
+        "ramp_hz_per_s": 120.0,
         "integral_limit": 10.0,
         "integral_active_error": 3.0,
     },
@@ -135,6 +151,7 @@ class RectTracker:
         self.last_target_center = None
         self.last_target_corners = None
         self.target_corners = None
+        self.search_anchor_rect = None
 
     def _sort_corners_fixed(self, pts):
         """严格的拓扑四角排序（左上、右上、右下、左下），防止倾斜时顶点对调闪烁"""
@@ -177,14 +194,14 @@ class RectTracker:
             ))
         return tuple(smoothed)
 
-    def detect(self, img):
+    def detect(self, img, force_global=False):
         self.frame_id += 1
         if self.target_found and (self.frame_id % TARGET_DETECT_INTERVAL) != 0:
             return self.target_found, self.target_rect, self.target_center
 
-        previous_center = self.last_target_center
+        previous_center = None if force_global else self.last_target_center
         previous_corners = self.last_target_corners
-        previous_rect = self.target_rect
+        previous_rect = None if force_global else (self.target_rect or self.search_anchor_rect)
         
         self.target_found = False
         self.target_fresh = False
@@ -192,7 +209,7 @@ class RectTracker:
         # 【终极防爆优化】锁死追踪 ROI，绝不放开全局边缘扫描
         if previous_rect is not None:
             px, py, pw, ph = previous_rect
-            pad = 30  
+            pad = 30 if self.target_rect is not None else 80
             rx = max(0, px - pad)
             ry = max(0, py - pad)
             rw = min(FRAME_WIDTH - rx, pw + pad * 2)
@@ -203,14 +220,42 @@ class RectTracker:
 
         # 【物理防爆防御】高阈值 + max_regions=2 限制线段总数，外加 try-except 保护机制
         rects = []
+        rect_keys = []
+        scan_threshold = RECT_TRACK_THRESHOLD if previous_rect is not None else RECT_GLOBAL_THRESHOLD
+        scan_max_regions = RECT_TRACK_MAX_REGIONS if previous_rect is not None else RECT_REACQUIRE_MAX_REGIONS
         try:
-            rects = img.find_rects(roi=search_roi, threshold=25000, max_regions=2) or []
+            local_rects = img.find_rects(
+                roi=search_roi,
+                threshold=scan_threshold,
+                max_regions=scan_max_regions
+            ) or []
+            for r in local_rects:
+                key = r.rect()
+                if key not in rect_keys:
+                    rect_keys.append(key)
+                    rects.append(r)
         except (RuntimeError, MemoryError):
             gc.collect()
-            rects = []
+
+        if self.target_rect is None and self.target_miss_count >= TARGET_REACQUIRE_GLOBAL_AFTER:
+            global_roi = (40, 30, FRAME_WIDTH - 80, FRAME_HEIGHT - 60)
+            if global_roi != search_roi:
+                try:
+                    global_rects = img.find_rects(
+                        roi=global_roi,
+                        threshold=RECT_GLOBAL_THRESHOLD,
+                        max_regions=RECT_REACQUIRE_MAX_REGIONS
+                    ) or []
+                    for r in global_rects:
+                        key = r.rect()
+                        if key not in rect_keys:
+                            rect_keys.append(key)
+                            rects.append(r)
+                except (RuntimeError, MemoryError):
+                    gc.collect()
 
         best_rect_obj = None
-        best_score = -1
+        best_score = None
         best_corners = None
         
         if rects:
@@ -235,7 +280,7 @@ class RectTracker:
                     d_sq = (cx - previous_center[0])**2 + (cy - previous_center[1])**2
                     score -= int(d_sq * 2.0)
                 
-                if score > best_score:
+                if best_score is None or score > best_score:
                     best_score = score
                     best_rect_obj = r
                     best_corners = c
@@ -253,6 +298,8 @@ class RectTracker:
                 self.target_corners = None
                 self.last_target_center = None
                 self.last_target_corners = None
+                if self.target_miss_count > TARGET_REACQUIRE_FRAMES:
+                    self.search_anchor_rect = None
                 return self.target_found, self.target_rect, self.target_center
 
         self.target_miss_count = 0
@@ -273,6 +320,7 @@ class RectTracker:
         rx = int(meas_cx - meas_w / 2.0)
         ry = int(meas_cy - meas_h / 2.0)
         self.target_rect = (rx, ry, int(meas_w), int(meas_h))
+        self.search_anchor_rect = self.target_rect
 
         # 同时平滑四角，确保你后面的 Homography 透视映射矩阵极其丝滑
         self.target_corners = self._sort_corners_fixed(best_corners)
@@ -285,6 +333,131 @@ class RectTracker:
 # ==========================================
 # 系统与控制逻辑
 # ==========================================
+class YawSearchController:
+    def __init__(self, enabled=True, start_delay_ms=300, search_freq_hz=500,
+                 direction=-1, half_turn_steps=1600, reverse_pause_ms=120):
+        self.enabled = bool(enabled)
+        self.start_delay_ms = max(0, int(start_delay_ms))
+        self.search_freq_hz = abs(float(search_freq_hz))
+        self.base_direction = 1 if direction >= 0 else -1
+        self.direction = self.base_direction
+        self.sweep_direction = self.base_direction
+        self.half_turn_steps = max(1, int(half_turn_steps))
+        self.reverse_pause_ms = max(0, int(reverse_pause_ms))
+        self._missing_since_ms = None
+        self._sweep_started_ms = None
+        self._phase_started_ms = None
+        self._phase = "idle"
+        self._active = False
+
+    def reset(self):
+        was_active = self._active
+        self._missing_since_ms = None
+        self._sweep_started_ms = None
+        self._phase_started_ms = None
+        self.direction = self.base_direction
+        self.sweep_direction = self.base_direction
+        self._phase = "idle"
+        self._active = False
+        return was_active
+
+    def is_searching(self):
+        return self._missing_since_ms is not None
+
+    def _half_turn_ms(self):
+        return max(1, int(self.half_turn_steps * 1000.0 / max(1.0, self.search_freq_hz)))
+
+    def _start_sweep(self, now_ms):
+        self._active = True
+        self._phase = "sweep"
+        self.direction = self.sweep_direction
+        self._sweep_started_ms = now_ms
+        self._phase_started_ms = now_ms
+
+    def _drive_search_motor(self, motor, command_hz):
+        if hasattr(motor, "drive_velocity"):
+            motor.drive_velocity(command_hz, 0.0, allow_drive=True)
+            return
+
+        x_axis = getattr(motor, "x_axis", None)
+        y_axis = getattr(motor, "y_axis", None)
+        if y_axis is not None:
+            y_axis.stop()
+        if x_axis is None:
+            motor.drive(command_hz, 0.0, allow_drive=True)
+            return
+
+        if (not getattr(x_axis, "ready", False)) or (not getattr(x_axis, "output_enabled", True)):
+            x_axis.stop()
+            return
+
+        signed_freq = float(command_hz) * float(getattr(x_axis, "command_sign", 1))
+        target_freq = abs(signed_freq)
+        if target_freq <= 0.0:
+            x_axis.stop()
+            return
+
+        if hasattr(x_axis, "_reset_pid"):
+            x_axis._reset_pid()
+        x_axis._last_update_ms = time.ticks_ms()
+        x_axis._current_freq = target_freq
+        x_axis._write_enable(True)
+        x_axis._set_direction(signed_freq >= 0.0)
+        x_axis._set_pwm(target_freq, getattr(x_axis, "step_duty", 50))
+
+    def update(self, motor, allow_drive=True):
+        if not allow_drive:
+            motor.stop()
+            self.reset()
+            return "CONTROL DISABLED -> HOLD"
+
+        if not self.enabled:
+            motor.stop()
+            self.reset()
+            return "NO RECT -> MOTOR HOLD"
+
+        now_ms = time.ticks_ms()
+        if self._missing_since_ms is None:
+            self._missing_since_ms = now_ms
+            motor.stop()
+            return "NO RECT -> YAW SEARCH WAIT"
+
+        if (not self._active) and time.ticks_diff(now_ms, self._missing_since_ms) < self.start_delay_ms:
+            motor.stop()
+            return "NO RECT -> YAW SEARCH WAIT"
+
+        if not self._active:
+            self._start_sweep(now_ms)
+
+        if self._phase == "pause":
+            if time.ticks_diff(now_ms, self._phase_started_ms) < self.reverse_pause_ms:
+                motor.stop()
+                return "YAW SEARCH AT ORIGIN"
+            self._start_sweep(now_ms)
+
+        if self._phase_started_ms is None:
+            self._phase_started_ms = now_ms
+
+        if time.ticks_diff(now_ms, self._phase_started_ms) >= self._half_turn_ms():
+            motor.stop()
+            if self._phase == "sweep":
+                self._phase = "return"
+                self.direction = -self.sweep_direction
+                self._phase_started_ms = now_ms
+                return "YAW SEARCH RETURN ORIGIN"
+            self.sweep_direction = -self.sweep_direction
+            self.direction = self.sweep_direction
+            self._phase = "pause"
+            self._phase_started_ms = now_ms
+            return "YAW SEARCH AT ORIGIN"
+
+        command = self.search_freq_hz * self.direction
+        self._drive_search_motor(motor, command)
+        if self._phase == "return":
+            return "YAW SEARCH RETURN ORIGIN"
+        return "YAW SEARCH CCW" if self.direction < 0 else "YAW SEARCH CW"
+
+
 class RectCenterSystem:
     def __init__(self):
         self.tracker = RectTracker()
@@ -311,6 +484,14 @@ class RectCenterSystem:
             start_delay_ms=PITCH_SEARCH_START_DELAY_MS,
             search_error=PITCH_SEARCH_ERROR_CM,
             segments=PITCH_SEARCH_SEGMENTS,
+        )
+        self.yaw_search = YawSearchController(
+            enabled=YAW_SEARCH_ENABLED,
+            start_delay_ms=YAW_SEARCH_START_DELAY_MS,
+            search_freq_hz=YAW_SEARCH_FREQ_HZ,
+            direction=YAW_SEARCH_DIRECTION,
+            half_turn_steps=YAW_SEARCH_HALF_TURN_STEPS,
+            reverse_pause_ms=YAW_SEARCH_REVERSE_PAUSE_MS,
         )
 
     def _report_control_state(self, state, dx=None, dy=None):
@@ -418,7 +599,8 @@ class RectCenterSystem:
         self.gc_counter += 1
         self._update_start_button()
 
-        found, rect, center = self.tracker.detect(img)
+        force_global_search = YAW_SEARCH_ENABLED and self.yaw_search.is_searching()
+        found, rect, center = self.tracker.detect(img, force_global=force_global_search)
         screen_center = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
 
         if not found or rect is None or center is None:
@@ -429,15 +611,27 @@ class RectCenterSystem:
             self.filtered_dx = None
             self.filtered_dy = None
             self._drive_filter_active = False
-            search_state = self.pitch_search.update(self.motor, allow_drive=self.control_started)
+            if YAW_SEARCH_ENABLED:
+                search_state = self.yaw_search.update(self.motor, allow_drive=self.control_started)
+            else:
+                search_state = self.pitch_search.update(self.motor, allow_drive=self.control_started)
             self._report_control_state(search_state)
             if DEBUG_MODE:
                 self._draw_overlay(img, None, None, screen_center,
                                    (LASER_DOT_X_PX, LASER_DOT_Y_PX), False, 8, status_text=search_state)
             return img
 
-        if self.pitch_search.reset():
+        search_was_active = self.yaw_search.reset()
+        pitch_search_was_active = self.pitch_search.reset()
+        if search_was_active or pitch_search_was_active:
             self.motor.stop()
+            if search_was_active:
+                self._report_control_state("TARGET FOUND -> SEARCH STOP")
+                if DEBUG_MODE:
+                    self._draw_overlay(img, rect, center, screen_center,
+                                       (LASER_DOT_X_PX, LASER_DOT_Y_PX), False, 8,
+                                       target_corners=self.tracker.target_corners)
+                return img
 
         _rx, _ry, rw, rh = rect
         px_per_cm_x = rw / TARGET_WIDTH_CM if rw > 0 else 4.0
@@ -449,12 +643,12 @@ class RectCenterSystem:
 
         dx = max(-MAX_AIM_ERROR_CM, min(MAX_AIM_ERROR_CM, dx))
         dy = max(-MAX_AIM_ERROR_CM, min(MAX_AIM_ERROR_CM, dy))
-        dx, dy = self._filter_control_error(dx, dy)
         self._drive_filter_active = (
             self.control_started
             and target_fresh
             and (abs(dx) > CONTROL_FILTER_DRIVE_ERROR_CM or abs(dy) > CONTROL_FILTER_DRIVE_ERROR_CM)
         )
+        dx, dy = self._filter_control_error(dx, dy)
 
         tolerance_px = int(ALIGNED_TOLERANCE_CM * max(px_per_cm_x, px_per_cm_y))
         aligned = (target_fresh and abs(dx) <= ALIGNED_TOLERANCE_CM and abs(dy) <= ALIGNED_TOLERANCE_CM)
@@ -529,6 +723,12 @@ class RectCenterSystem:
 # 主运行入口
 # ==========================================
 def main():
+    sensor = None
+    try:
+        os.exitpoint(os.EXITPOINT_ENABLE)
+    except Exception:
+        pass
+
     print("=" * 50)
     print("K230 Rect Center Mode - FINAL TUNED")
     print("build:", BUILD_TAG)
@@ -589,7 +789,9 @@ def main():
                 time.sleep_ms(FRAME_LOOP_DELAY_MS)
                 continue
 
+            os.exitpoint()
             img = system.process_frame(img)
+            os.exitpoint()
             system.update_fps()
 
             if hasattr(Display, 'show_image'):
@@ -597,6 +799,7 @@ def main():
             else:
                 Display.show(img)
 
+            os.exitpoint()
             system.maybe_collect_gc()
             time.sleep_ms(FRAME_LOOP_DELAY_MS)
             
@@ -607,6 +810,10 @@ def main():
         sys.print_exception(e)
     finally:
         print("[System] cleanup...")
+        try:
+            system.motor.stop()
+        except Exception:
+            pass
         camera_deinit(sensor)
         system.motor.deinit()
         print("[System] stopped")

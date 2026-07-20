@@ -175,6 +175,7 @@ class StepperAxis:
         self.step_duty = int(config.get("step_duty", 50))
         self.min_freq = int(config.get("min_freq", 120))
         self.max_freq = int(config.get("max_freq", 1800))
+        self.manual_max_freq = int(config.get("manual_max_freq", self.max_freq))
         self.ramp_hz_per_s = float(config.get("ramp_hz_per_s", 3200))
         self.deadband = float(config.get("deadband", 0.0))
         self.error_full_scale = max(float(config.get("error_full_scale", 80.0)), self.deadband + 1e-6)
@@ -409,6 +410,26 @@ class StepperAxis:
 
         self._set_pwm(self._current_freq, self.step_duty)
 
+    def drive_velocity(self, freq_hz, allow_drive=True):
+        if (not self.ready) or (not self.output_enabled) or (not allow_drive) or (freq_hz is None):
+            self.stop()
+            self._last_update_ms = time.ticks_ms()
+            return
+
+        signed_freq = float(freq_hz) * float(self.command_sign)
+        target_freq = min(abs(signed_freq), max(1, self.manual_max_freq))
+        if target_freq <= 0.0:
+            self.stop()
+            self._last_update_ms = time.ticks_ms()
+            return
+
+        self._last_update_ms = time.ticks_ms()
+        self._reset_pid()
+        self._current_freq = target_freq
+        self._write_enable(True)
+        self._set_direction(signed_freq >= 0.0)
+        self._set_pwm(target_freq, self.step_duty)
+
     def deinit(self):
         self.output_enabled = False
         self.stop()
@@ -432,6 +453,10 @@ class DualAxisStepperController:
     def drive(self, error_x, error_y, allow_drive=True):
         self.x_axis.drive_error(error_x, allow_drive=allow_drive)
         self.y_axis.drive_error(error_y, allow_drive=allow_drive)
+
+    def drive_velocity(self, freq_x_hz, freq_y_hz, allow_drive=True):
+        self.x_axis.drive_velocity(freq_x_hz, allow_drive=allow_drive)
+        self.y_axis.drive_velocity(freq_y_hz, allow_drive=allow_drive)
 
     def stop(self):
         self.x_axis.stop()

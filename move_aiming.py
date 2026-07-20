@@ -95,7 +95,23 @@ CIRCLE_RADIUS_SMOOTHING_ALPHA = 0.45
 TARGET_POINT_HISTORY_LEN = 3
 LASER_POINT_HISTORY_LEN = 1
 RADIUS_HISTORY_LEN = 3
-BUILD_TAG = "2026-07-14-aim-fastboot-v19"
+VISUAL_RATE_FILTER_ALPHA = 0.45
+TURN_BOOST_ENTER_RATE_CM_S = 18.0
+TURN_BOOST_EXIT_RATE_CM_S = 8.0
+TURN_BOOST_MIN_FRAMES = 2
+TURN_BOOST_EXIT_FRAMES = 3
+TURN_BOOST_GROWTH_DELTA_CM = 0.35
+TURN_BOOST_EXIT_ERROR_CM = 1.2
+YAW_LEAD_GAIN_NORMAL = 0.035
+YAW_LEAD_GAIN_TURN = 0.075
+YAW_LEAD_MAX_CM = 2.0
+LOSS_HOLD_MS = 280
+HOLD_COMMAND_DECAY = 0.35
+PITCH_LEAD_GAIN = 0.0
+NORMAL_YAW_CMD_LIMIT_CM = 5.0
+TURN_BOOST_YAW_CMD_LIMIT_CM = 7.0
+PITCH_CMD_LIMIT_CM = 5.0
+BUILD_TAG = "2026-07-20-aim-turnboost-v20"
 
 # ── Testing without button board ──────────────────────────────────
 # Set True to skip GPIO28 start-button wait.
@@ -176,8 +192,18 @@ class TargetDetector:
         self.frozen_target_diameter_px = 0
         self.frozen_bullseye_center = None
         self.predict_miss_count = 0
+        self.frame_timestamp_ms = 0
+        self.target_visual_valid = False
+        self.bullseye_visual_valid = False
+        self.laser_visual_valid = False
+        self.prediction_active = False
 
     def detect_all(self, img):
+        self.frame_timestamp_ms = time.ticks_ms()
+        self.target_visual_valid = False
+        self.bullseye_visual_valid = False
+        self.laser_visual_valid = False
+        self.prediction_active = False
         self.frame_id += 1
         self._detect_target(img)
         if self.target_found:
@@ -187,6 +213,7 @@ class TargetDetector:
             self._refresh_prediction_anchor()
         else:
             if self._prediction_available() and self.predict_miss_count < PREDICT_TRACK_MAX_FRAMES:
+                self.prediction_active = True
                 self.predict_miss_count += 1
                 self.target_rect = self.frozen_target_rect
                 self.target_center = self.frozen_target_center
@@ -237,7 +264,14 @@ class TargetDetector:
 
     def _expand_rect(self, rect, margin):
         x, y, w, h = rect
-        return clamp_rect(x - margin, y - margin, w + margin * 2, h + margin * 2)
+        return clamp_rect(
+            x - margin,
+            y - margin,
+            w + margin * 2,
+            h + margin * 2,
+            FRAME_WIDTH,
+            FRAME_HEIGHT,
+        )
     def _select_best_rect(self, rect_img, rects, reference_center, reference_rect):
         best = None
         best_score = None
@@ -248,7 +282,14 @@ class TargetDetector:
             corners = r.corners()
             if raw_rect is None or corners is None or len(corners) != 4:
                 continue
-            rect = compensate_edge_rect(raw_rect, reference_rect)
+            rect = compensate_edge_rect(
+                raw_rect,
+                reference_rect,
+                TARGET_EDGE_MARGIN_PX,
+                TARGET_EDGE_COMP_MIN_RATIO,
+                FRAME_WIDTH,
+                FRAME_HEIGHT,
+            )
             x, y, w, h = rect
             if w < TARGET_MIN_W or h < TARGET_MIN_H:
                 continue
@@ -372,6 +413,7 @@ class TargetDetector:
         self.target_center = None
         self.target_diameter_px = 0
         self.target_found = False
+        self.target_visual_valid = False
 
         rect_img = self._prepare_rect_image(img)
         rects = rect_img.find_rects(threshold=RECT_THRESHOLD) or []
@@ -417,9 +459,12 @@ class TargetDetector:
             previous_center,
             TARGET_LEAD_GAIN,
             TARGET_LEAD_MAX_PX,
+            FRAME_WIDTH,
+            FRAME_HEIGHT,
         )
         self.target_diameter_px = min(rect[2], rect[3])
         self.target_found = True
+        self.target_visual_valid = True
         self.last_target_rect = self.target_rect
         self.last_target_corners = corners
         self.last_target_center = self.target_center
@@ -430,6 +475,7 @@ class TargetDetector:
     def _detect_bullseye(self, img):
         self.bullseye_found = False
         self.bullseye_center = None
+        self.bullseye_visual_valid = False
         if not (self.target_found and self.target_rect and self.target_center):
             return
         if (
@@ -453,14 +499,18 @@ class TargetDetector:
             self.last_bullseye_center,
             BULLSEYE_LEAD_GAIN,
             BULLSEYE_LEAD_MAX_PX,
+            FRAME_WIDTH,
+            FRAME_HEIGHT,
         )
         self.last_bullseye_center = self.bullseye_center
         self.bullseye_found = True
+        self.bullseye_visual_valid = True
         self.bullseye_miss_count = 0
 
     def _detect_laser(self, img):
         self.laser_spot = None
         self.laser_found = False
+        self.laser_visual_valid = False
         if self.target_rect is None:
             return None
         roi = self.target_rect
@@ -508,6 +558,7 @@ class TargetDetector:
             )
             self.laser_spot = filter_point_history(self.laser_spot_history)
             self.laser_found = True
+            self.laser_visual_valid = True
             self.last_laser_spot = self.laser_spot
             self.laser_miss_count = 0
             return self.laser_spot
@@ -608,12 +659,19 @@ class TargetDetector:
         distance_cm = math.sqrt(dx_cm * dx_cm + dy_cm * dy_cm)
         angle_deg = math.degrees(math.atan2(-dy_cm, dx_cm))
         return {
+            "timestamp_ms": self.frame_timestamp_ms,
             "dx_cm": dx_cm,
             "dy_cm": dy_cm,
             "distance_cm": distance_cm,
             "angle_deg": angle_deg,
             "laser_px": (lx, ly),
             "target_px": (bx, by),
+            "bullseye_plane_cm": self.bullseye_plane_cm,
+            "laser_plane_cm": laser_plane_cm,
+            "target_valid": self.target_visual_valid,
+            "bullseye_valid": self.bullseye_visual_valid,
+            "laser_valid": self.laser_visual_valid,
+            "prediction_active": self.prediction_active,
         }
 
 
@@ -648,6 +706,22 @@ class AimingSystem:
         self.fps = 0.0
         self.last_fps_time = time.ticks_ms()
         self.gc_counter = 0
+        self.control_state = "aim"
+        self.turn_boost_active = False
+        self.turn_boost_enter_count = 0
+        self.turn_boost_exit_count = 0
+        self.dx_growth_count = 0
+        self.last_turn_eval_dx_cm = None
+        self.last_rate_sample = None
+        self.last_visual_dx_rate = 0.0
+        self.last_visual_dy_rate = 0.0
+        self.last_valid_offset_ms = None
+        self.last_valid_base_dx_cm = 0.0
+        self.last_valid_base_dy_cm = 0.0
+        self.last_yaw_lead_cm = 0.0
+        self.last_pitch_lead_cm = 0.0
+        self.last_cmd_dx_cm = 0.0
+        self.last_cmd_dy_cm = 0.0
 
     def _update_start_button(self):
         if self.control_started:
@@ -656,6 +730,100 @@ class AimingSystem:
             self.control_started = True
             print("[Motor] start button pressed, stepper control enabled")
 
+    def _compute_visual_rates(self, offset_info):
+        if offset_info is None:
+            self.last_visual_dx_rate = 0.0
+            self.last_visual_dy_rate = 0.0
+            self.last_rate_sample = None
+            return 0.0, 0.0
+
+        current_sample = {
+            "timestamp_ms": offset_info.get("timestamp_ms", time.ticks_ms()),
+            "dx_cm": offset_info["dx_cm"],
+            "dy_cm": offset_info["dy_cm"],
+        }
+        previous_sample = self.last_rate_sample
+        self.last_rate_sample = current_sample
+        if previous_sample is None:
+            self.last_visual_dx_rate = 0.0
+            self.last_visual_dy_rate = 0.0
+            return 0.0, 0.0
+
+        dt_ms = max(1, time.ticks_diff(current_sample["timestamp_ms"], previous_sample["timestamp_ms"]))
+        raw_dx_rate = (current_sample["dx_cm"] - previous_sample["dx_cm"]) * 1000.0 / dt_ms
+        raw_dy_rate = (current_sample["dy_cm"] - previous_sample["dy_cm"]) * 1000.0 / dt_ms
+        alpha = VISUAL_RATE_FILTER_ALPHA
+        self.last_visual_dx_rate = self.last_visual_dx_rate * (1.0 - alpha) + raw_dx_rate * alpha
+        self.last_visual_dy_rate = self.last_visual_dy_rate * (1.0 - alpha) + raw_dy_rate * alpha
+        return self.last_visual_dx_rate, self.last_visual_dy_rate
+
+    def _compute_yaw_lead(self, dx_cm_rate):
+        gain = YAW_LEAD_GAIN_TURN if self.turn_boost_active else YAW_LEAD_GAIN_NORMAL
+        yaw_lead_cm = dx_cm_rate * gain
+        if yaw_lead_cm > YAW_LEAD_MAX_CM:
+            yaw_lead_cm = YAW_LEAD_MAX_CM
+        elif yaw_lead_cm < -YAW_LEAD_MAX_CM:
+            yaw_lead_cm = -YAW_LEAD_MAX_CM
+        return yaw_lead_cm
+
+    def _update_turn_boost_state(self, dx_cm, dx_cm_rate):
+        growing = False
+        if self.last_turn_eval_dx_cm is not None:
+            same_side = dx_cm * self.last_turn_eval_dx_cm > 0.0
+            error_growing = abs(dx_cm) > (abs(self.last_turn_eval_dx_cm) + TURN_BOOST_GROWTH_DELTA_CM)
+            if same_side and error_growing:
+                self.dx_growth_count += 1
+            else:
+                self.dx_growth_count = 0
+            growing = self.dx_growth_count >= TURN_BOOST_MIN_FRAMES
+        self.last_turn_eval_dx_cm = dx_cm
+
+        rate_trigger = abs(dx_cm_rate) >= TURN_BOOST_ENTER_RATE_CM_S
+        if self.turn_boost_active:
+            calm_rate = abs(dx_cm_rate) <= TURN_BOOST_EXIT_RATE_CM_S
+            calm_error = abs(dx_cm) <= TURN_BOOST_EXIT_ERROR_CM
+            if calm_rate and calm_error:
+                self.turn_boost_exit_count += 1
+            else:
+                self.turn_boost_exit_count = 0
+            if self.turn_boost_exit_count >= TURN_BOOST_EXIT_FRAMES:
+                self.turn_boost_active = False
+                self.turn_boost_enter_count = 0
+                self.turn_boost_exit_count = 0
+                self.dx_growth_count = 0
+        else:
+            if rate_trigger or growing:
+                self.turn_boost_enter_count += 1
+            else:
+                self.turn_boost_enter_count = 0
+            if self.turn_boost_enter_count >= TURN_BOOST_MIN_FRAMES:
+                self.turn_boost_active = True
+                self.turn_boost_exit_count = 0
+
+        return self.turn_boost_active
+
+    def _compute_hold_command(self, now_ms):
+        if self.last_valid_offset_ms is None:
+            return None
+        hold_age_ms = time.ticks_diff(now_ms, self.last_valid_offset_ms)
+        if hold_age_ms < 0 or hold_age_ms > LOSS_HOLD_MS:
+            return None
+
+        age_ratio = hold_age_ms / float(max(1, LOSS_HOLD_MS))
+        lead_scale = HOLD_COMMAND_DECAY + (1.0 - HOLD_COMMAND_DECAY) * (1.0 - age_ratio)
+        cmd_dx = self.last_valid_base_dx_cm + self.last_yaw_lead_cm * lead_scale
+        cmd_dy = self.last_valid_base_dy_cm + self.last_pitch_lead_cm * lead_scale
+        yaw_limit = TURN_BOOST_YAW_CMD_LIMIT_CM if self.turn_boost_active else NORMAL_YAW_CMD_LIMIT_CM
+        cmd_dx = max(-yaw_limit, min(yaw_limit, cmd_dx))
+        cmd_dy = max(-PITCH_CMD_LIMIT_CM, min(PITCH_CMD_LIMIT_CM, cmd_dy))
+        return {
+            "cmd_dx_cm": cmd_dx,
+            "cmd_dy_cm": cmd_dy,
+            "hold_age_ms": hold_age_ms,
+            "yaw_lead_cm": self.last_yaw_lead_cm * lead_scale,
+            "pitch_lead_cm": self.last_pitch_lead_cm * lead_scale,
+        }
+
     def process_frame(self, img):
         self.frame_count += 1
         self.gc_counter += 1
@@ -663,33 +831,133 @@ class AimingSystem:
 
         self.detector.detect_all(img)
         offset_info = self.detector.get_offset_info()
+        now_ms = time.ticks_ms()
+        control_debug = {
+            "state": self.control_state,
+            "dx_cm": None,
+            "dy_cm": None,
+            "dx_rate_cm_s": self.last_visual_dx_rate,
+            "dy_rate_cm_s": self.last_visual_dy_rate,
+            "yaw_lead_cm": self.last_yaw_lead_cm,
+            "hold_age_ms": None,
+            "cmd_dx_cm": self.last_cmd_dx_cm,
+            "cmd_dy_cm": self.last_cmd_dy_cm,
+        }
 
         if self.mode == "aim":
             if offset_info is None:
-                self.motor.stop()
+                hold_command = self._compute_hold_command(now_ms)
+                if hold_command is None:
+                    self.control_state = "aim"
+                    self.turn_boost_active = False
+                    self.turn_boost_enter_count = 0
+                    self.turn_boost_exit_count = 0
+                    self.dx_growth_count = 0
+                    self.last_turn_eval_dx_cm = None
+                    self.motor.stop()
+                    control_debug.update({
+                        "state": self.control_state,
+                        "dx_rate_cm_s": self.last_visual_dx_rate,
+                        "dy_rate_cm_s": self.last_visual_dy_rate,
+                        "yaw_lead_cm": 0.0,
+                        "cmd_dx_cm": 0.0,
+                        "cmd_dy_cm": 0.0,
+                    })
+                else:
+                    self.control_state = "loss_hold"
+                    self.motor.drive(
+                        hold_command["cmd_dx_cm"],
+                        hold_command["cmd_dy_cm"],
+                        allow_drive=self.control_started,
+                    )
+                    self.last_cmd_dx_cm = hold_command["cmd_dx_cm"]
+                    self.last_cmd_dy_cm = hold_command["cmd_dy_cm"]
+                    control_debug.update({
+                        "state": self.control_state,
+                        "dx_cm": self.last_valid_base_dx_cm,
+                        "dy_cm": self.last_valid_base_dy_cm,
+                        "dx_rate_cm_s": self.last_visual_dx_rate,
+                        "dy_rate_cm_s": self.last_visual_dy_rate,
+                        "yaw_lead_cm": hold_command["yaw_lead_cm"],
+                        "hold_age_ms": hold_command["hold_age_ms"],
+                        "cmd_dx_cm": hold_command["cmd_dx_cm"],
+                        "cmd_dy_cm": hold_command["cmd_dy_cm"],
+                    })
             else:
+                dx_rate_cm_s, dy_rate_cm_s = self._compute_visual_rates(offset_info)
+                self._update_turn_boost_state(offset_info["dx_cm"], dx_rate_cm_s)
+                yaw_lead_cm = self._compute_yaw_lead(dx_rate_cm_s)
+                pitch_lead_cm = dy_rate_cm_s * PITCH_LEAD_GAIN
+                cmd_dx_cm = offset_info["dx_cm"] + yaw_lead_cm
+                cmd_dy_cm = offset_info["dy_cm"] + pitch_lead_cm
+                yaw_limit = TURN_BOOST_YAW_CMD_LIMIT_CM if self.turn_boost_active else NORMAL_YAW_CMD_LIMIT_CM
+                cmd_dx_cm = max(-yaw_limit, min(yaw_limit, cmd_dx_cm))
+                cmd_dy_cm = max(-PITCH_CMD_LIMIT_CM, min(PITCH_CMD_LIMIT_CM, cmd_dy_cm))
                 self.motor.drive(
-                    offset_info["dx_cm"],
-                    offset_info["dy_cm"],
+                    cmd_dx_cm,
+                    cmd_dy_cm,
                     allow_drive=self.control_started,
                 )
+                self.last_valid_offset_ms = offset_info["timestamp_ms"]
+                self.last_valid_base_dx_cm = offset_info["dx_cm"]
+                self.last_valid_base_dy_cm = offset_info["dy_cm"]
+                self.last_yaw_lead_cm = yaw_lead_cm
+                self.last_pitch_lead_cm = pitch_lead_cm
+                self.last_cmd_dx_cm = cmd_dx_cm
+                self.last_cmd_dy_cm = cmd_dy_cm
+                self.control_state = "turn_boost" if self.turn_boost_active else "aim"
+                control_debug.update({
+                    "state": self.control_state,
+                    "dx_cm": offset_info["dx_cm"],
+                    "dy_cm": offset_info["dy_cm"],
+                    "dx_rate_cm_s": dx_rate_cm_s,
+                    "dy_rate_cm_s": dy_rate_cm_s,
+                    "yaw_lead_cm": yaw_lead_cm,
+                    "hold_age_ms": max(0, time.ticks_diff(now_ms, offset_info["timestamp_ms"])),
+                    "cmd_dx_cm": cmd_dx_cm,
+                    "cmd_dy_cm": cmd_dy_cm,
+                })
         elif self.mode == "circle":
             target_dx, target_dy = self.trajectory.get_target_point()
             if offset_info is None:
                 self.motor.stop()
+                control_debug.update({
+                    "state": "circle",
+                    "dx_rate_cm_s": self.last_visual_dx_rate,
+                    "dy_rate_cm_s": self.last_visual_dy_rate,
+                })
             else:
                 self.motor.drive(
                     target_dx - offset_info["dx_cm"],
                     target_dy - offset_info["dy_cm"],
                     allow_drive=self.control_started,
                 )
+                control_debug.update({
+                    "state": "circle",
+                    "dx_cm": offset_info["dx_cm"],
+                    "dy_cm": offset_info["dy_cm"],
+                    "dx_rate_cm_s": self.last_visual_dx_rate,
+                    "dy_rate_cm_s": self.last_visual_dy_rate,
+                    "yaw_lead_cm": 0.0,
+                    "hold_age_ms": max(0, time.ticks_diff(now_ms, offset_info["timestamp_ms"])),
+                    "cmd_dx_cm": target_dx - offset_info["dx_cm"],
+                    "cmd_dy_cm": target_dy - offset_info["dy_cm"],
+                })
+            self.control_state = "circle"
+        else:
+            self.control_state = "idle"
+            control_debug.update({
+                "state": "idle",
+                "dx_rate_cm_s": self.last_visual_dx_rate,
+                "dy_rate_cm_s": self.last_visual_dy_rate,
+            })
 
         if DEBUG_MODE:
-            self._draw_debug_overlay(img, offset_info)
+            self._draw_debug_overlay(img, offset_info, control_debug)
 
         return img
 
-    def _draw_debug_overlay(self, img, offset_info):
+    def _draw_debug_overlay(self, img, offset_info, control_debug):
         if self.detector.target_found and self.detector.target_rect:
             x, y, w, h = self.detector.target_rect
             img.draw_rectangle(x, y, w, h, color=(0, 255, 0), thickness=1)
@@ -716,12 +984,71 @@ class AimingSystem:
                     color=(255, 255, 255),
                     scale=1,
                 )
+                draw_text(
+                    img,
+                    4,
+                    22,
+                    "dx={:.1f} dy={:.1f}".format(
+                        control_debug["dx_cm"], control_debug["dy_cm"]
+                    ),
+                    color=(255, 255, 255),
+                    scale=1,
+                )
+                draw_text(
+                    img,
+                    4,
+                    40,
+                    "vx={:.1f} lead={:.1f}".format(
+                        control_debug["dx_rate_cm_s"], control_debug["yaw_lead_cm"]
+                    ),
+                    color=(255, 255, 255),
+                    scale=1,
+                )
+                draw_text(
+                    img,
+                    4,
+                    58,
+                    "age={}ms {}".format(
+                        int(control_debug["hold_age_ms"] or 0),
+                        control_debug["state"].upper(),
+                    ),
+                    color=(255, 255, 0),
+                    scale=1,
+                )
+            else:
+                draw_text(
+                    img,
+                    4,
+                    4,
+                    "STATE {}".format(control_debug["state"].upper()),
+                    color=(255, 255, 0),
+                    scale=1,
+                )
+                draw_text(
+                    img,
+                    4,
+                    22,
+                    "vx={:.1f} lead={:.1f}".format(
+                        control_debug["dx_rate_cm_s"], control_debug["yaw_lead_cm"]
+                    ),
+                    color=(255, 255, 255),
+                    scale=1,
+                )
+                if control_debug["hold_age_ms"] is not None:
+                    draw_text(
+                        img,
+                        4,
+                        40,
+                        "hold={}ms".format(int(control_debug["hold_age_ms"])),
+                        color=(255, 255, 0),
+                        scale=1,
+                    )
 
             draw_text(
                 img,
                 4,
                 FRAME_HEIGHT - 16,
-                "Mode: {}".format(self.mode.upper()),
+                "Mode: {}/{}".format(self.mode.upper(), control_debug["state"].upper()),
                 color=(0, 255, 0),
                 scale=1,
             )
