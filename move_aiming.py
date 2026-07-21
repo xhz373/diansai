@@ -4,19 +4,51 @@ import os
 import sys
 import time
 
-from common_hw import (DebouncedButton as StartButton, Display, draw_text,
-                        camera_init, camera_start, camera_snapshot,
-                        camera_restart, camera_deinit,
-                        display_init)
-from vision_utils import (clamp_rect, dist_sq, smooth_center, smooth_scalar,
-                           apply_motion_lead, push_point_history, filter_point_history,
-                           push_scalar_history, filter_scalar_history,
-                           rect_aspect_error, rect_center_from_corners,
-                           rect_size_change_ok, compensate_edge_rect,
-                           rect_overlap_ratio, rect_border_hit_ratio,
-                           expand_rect, compute_homography, apply_homography,
-                           normalize_corners, plane_size_cm_for_corners,
-                           log_info)
+def _append_import_paths():
+    for candidate in (
+        ".",
+        "/flash",
+        "/flash/app",
+        "/flash/lib",
+        "/sdcard",
+        "/sdcard/app",
+        "/sdcard/lib",
+    ):
+        try:
+            if candidate not in sys.path:
+                sys.path.append(candidate)
+        except Exception:
+            pass
+
+
+_append_import_paths()
+
+try:
+    from common_hw import (DebouncedButton as StartButton, Display, draw_text,
+                            camera_init, camera_start, camera_snapshot,
+                            camera_restart, camera_deinit,
+                            display_init)
+except ImportError:
+    raise ImportError(
+        "common_hw not found; copy common_hw.py to the same folder as move_aiming.py, "
+        "/flash, /flash/app, /flash/lib, /sdcard, /sdcard/app, or /sdcard/lib before running."
+    )
+
+try:
+    from vision_utils import (clamp_rect, dist_sq, smooth_center, smooth_scalar,
+                               apply_motion_lead, push_point_history, filter_point_history,
+                               push_scalar_history, filter_scalar_history,
+                               rect_aspect_error, rect_center_from_corners,
+                               rect_size_change_ok, compensate_edge_rect,
+                               rect_overlap_ratio, rect_border_hit_ratio,
+                               expand_rect, compute_homography, apply_homography,
+                               normalize_corners, plane_size_cm_for_corners,
+                               log_info)
+except ImportError:
+    raise ImportError(
+        "vision_utils not found; copy vision_utils.py with move_aiming.py dependencies "
+        "to /flash, /flash/app, /sdcard, or /sdcard/app before running."
+    )
 
 try:
     from k230_common import build_stepper_controller, load_calibration
@@ -53,6 +85,12 @@ VIOLET_THRESHOLD = (92, 100, -15, 6, -9, 11)
 
 RECT_THRESHOLD = 8000
 RECT_BINARY_THRESHOLD = (0, 72)
+RECT_TRACK_THRESHOLD = 25000
+RECT_GLOBAL_THRESHOLD = 20000
+RECT_TRACK_MAX_REGIONS = 2
+RECT_REACQUIRE_MAX_REGIONS = 4
+RECT_TRACK_PAD_PX = 30
+RECT_REACQUIRE_PAD_PX = 80
 TARGET_MIN_W = 44
 TARGET_MIN_H = 44
 TARGET_MIN_AREA = 3600
@@ -87,6 +125,8 @@ DEBUG_TEXT_OVERLAY = False
 FRAME_LOOP_DELAY_MS = 0
 MAX_CONSECUTIVE_SNAPSHOT_FAILURES = 5
 TARGET_MAX_MISS_FRAMES = 6
+TARGET_REACQUIRE_FRAMES = 24
+TARGET_REACQUIRE_GLOBAL_AFTER = 4
 LASER_MAX_MISS_FRAMES = 2
 LASER_STICKY_PX = 2
 PREDICT_TRACK_MAX_FRAMES = 30
@@ -106,6 +146,9 @@ YAW_LEAD_GAIN_NORMAL = 0.035
 YAW_LEAD_GAIN_TURN = 0.075
 YAW_LEAD_MAX_CM = 2.0
 LOSS_HOLD_MS = 280
+LOSS_REACQUIRE_MS = 1600
+LOSS_REACQUIRE_YAW_CMD_CM = 6.0
+LOSS_REACQUIRE_PITCH_HOLD_RATIO = 0.35
 HOLD_COMMAND_DECAY = 0.35
 PITCH_LEAD_GAIN = 0.0
 NORMAL_YAW_CMD_LIMIT_CM = 5.0
@@ -121,20 +164,20 @@ STEPPER_AXIS_OVERRIDES = {
     "x": {
         "deadband": 0.25,
         "error_full_scale": 5.0,
-        "command_sign": 1,
-        "pid_kp": 180.0,
-        "pid_ki": 10.0,
-        "pid_kd": 2.5,
+        "command_sign": -1,
+        "pid_kp": 0.1,
+        "pid_ki": 0.0,
+        "pid_kd": 0.0,
         "integral_limit": 6.0,
         "integral_active_error": 2.8,
     },
     "y": {
         "deadband": 0.25,
         "error_full_scale": 5.0,
-        "command_sign": 1,
-        "pid_kp": 180.0,
-        "pid_ki": 10.0,
-        "pid_kd": 2.5,
+        "command_sign": -1,
+        "pid_kp": 0.1,
+        "pid_ki": 0.0,
+        "pid_kd": 0.0,
         "integral_limit": 6.0,
         "integral_active_error": 2.8,
     },
@@ -177,6 +220,7 @@ class TargetDetector:
         self.last_target_center = None
         self.last_target_diameter_px = 0
         self.last_target_corners = None
+        self.search_anchor_rect = None
         self.last_bullseye_center = None
         self.bullseye_miss_count = 0
         self.last_laser_spot = None
@@ -272,6 +316,22 @@ class TargetDetector:
             FRAME_WIDTH,
             FRAME_HEIGHT,
         )
+
+    def _target_search_roi(self, reference_rect, target_is_active):
+        if reference_rect is None:
+            return (40, 30, FRAME_WIDTH - 80, FRAME_HEIGHT - 60)
+
+        x, y, w, h = reference_rect
+        pad = RECT_TRACK_PAD_PX if target_is_active else RECT_REACQUIRE_PAD_PX
+        return clamp_rect(
+            x - pad,
+            y - pad,
+            w + pad * 2,
+            h + pad * 2,
+            FRAME_WIDTH,
+            FRAME_HEIGHT,
+        )
+
     def _select_best_rect(self, rect_img, rects, reference_center, reference_rect):
         best = None
         best_score = None
@@ -296,11 +356,16 @@ class TargetDetector:
             area = w * h
             if area < TARGET_MIN_AREA:
                 continue
-            if not rect_size_change_ok(rect, reference_rect):
+            if not rect_size_change_ok(rect, reference_rect, TARGET_MAX_SIZE_CHANGE_RATIO):
                 continue
 
-            center = rect_center_from_corners(corners)
-            border_hit_ratio = rect_border_hit_ratio(rect_img, rect)
+            center = rect_center_from_corners(corners, FRAME_WIDTH, FRAME_HEIGHT)
+            border_hit_ratio = rect_border_hit_ratio(
+                rect_img,
+                rect,
+                TARGET_BORDER_SAMPLE_COUNT,
+                corners,
+            )
             if border_hit_ratio < TARGET_BORDER_HIT_RATIO_MIN:
                 continue
             if reference_center is not None:
@@ -314,7 +379,9 @@ class TargetDetector:
                     or dist_sq(center, reference_center) > (TARGET_STICKY_DIST_PX * TARGET_STICKY_DIST_PX)
                 ):
                     continue
-            aspect_penalty = int(rect_aspect_error(w, h) * TARGET_ASPECT_PENALTY_SCALE)
+            aspect_penalty = int(
+                rect_aspect_error(w, h, TARGET_ASPECT) * TARGET_ASPECT_PENALTY_SCALE
+            )
             if reference_center is not None:
                 distance_penalty = dist_sq(center, reference_center) // 10
             else:
@@ -381,8 +448,8 @@ class TargetDetector:
         for blob in blobs:
             bx = blob.cx()
             by = blob.cy()
-            dist_sq = dist_sq((bx, by), self.target_center)
-            if dist_sq > gate_sq:
+            distance_sq = dist_sq((bx, by), self.target_center)
+            if distance_sq > gate_sq:
                 continue
             weight = max(1.0, float(blob.pixels()))
             weighted_x += bx * weight
@@ -405,7 +472,7 @@ class TargetDetector:
         if self.target_found and (self.frame_id % TARGET_DETECT_INTERVAL) != 0:
             return
 
-        previous_rect = self.last_target_rect
+        previous_rect = self.last_target_rect or self.search_anchor_rect
         previous_center = self.last_target_center
         previous_diameter = self.last_target_diameter_px
         previous_corners = self.last_target_corners
@@ -416,11 +483,39 @@ class TargetDetector:
         self.target_visual_valid = False
 
         rect_img = self._prepare_rect_image(img)
-        rects = rect_img.find_rects(threshold=RECT_THRESHOLD) or []
+        search_roi = self._target_search_roi(previous_rect, self.last_target_rect is not None)
+        scan_threshold = RECT_TRACK_THRESHOLD if previous_rect is not None else RECT_GLOBAL_THRESHOLD
+        scan_max_regions = (
+            RECT_TRACK_MAX_REGIONS if previous_rect is not None else RECT_REACQUIRE_MAX_REGIONS
+        )
+        try:
+            rects = rect_img.find_rects(
+                roi=search_roi,
+                threshold=scan_threshold,
+                max_regions=scan_max_regions,
+            ) or []
+        except (RuntimeError, MemoryError):
+            gc.collect()
+            rects = []
         chosen = self._select_best_rect(rect_img, rects, previous_center, previous_rect)
+        used_global_reacquire = False
+        if chosen is None and self.target_miss_count >= TARGET_REACQUIRE_GLOBAL_AFTER:
+            global_roi = (40, 30, FRAME_WIDTH - 80, FRAME_HEIGHT - 60)
+            if global_roi != search_roi:
+                try:
+                    global_rects = rect_img.find_rects(
+                        roi=global_roi,
+                        threshold=RECT_GLOBAL_THRESHOLD,
+                        max_regions=RECT_REACQUIRE_MAX_REGIONS,
+                    ) or []
+                except (RuntimeError, MemoryError):
+                    gc.collect()
+                    global_rects = []
+                chosen = self._select_best_rect(rect_img, global_rects, None, None)
+                used_global_reacquire = chosen is not None
         if chosen is not None:
             _, _, center = chosen
-            if not self._accept_center(center, previous_center):
+            if not used_global_reacquire and not self._accept_center(center, previous_center):
                 chosen = None
 
         if chosen is None:
@@ -436,6 +531,8 @@ class TargetDetector:
                 self.last_target_center = None
                 self.last_target_diameter_px = 0
                 self.last_target_corners = None
+                if self.target_miss_count > TARGET_REACQUIRE_FRAMES:
+                    self.search_anchor_rect = None
                 self.target_center_history = []
                 self.bullseye_center_history = []
                 self.laser_spot_history = []
@@ -447,20 +544,13 @@ class TargetDetector:
         self.target_miss_count = 0
         rect, corners, center = chosen
         self.target_rect = rect
+        self.search_anchor_rect = rect
         self.target_center = smooth_center(
             center,
             previous_center,
             TARGET_CENTER_ALPHA,
             TARGET_RESET_DIST_PX,
             TARGET_STICKY_DIST_PX,
-        )
-        self.target_center = apply_motion_lead(
-            self.target_center,
-            previous_center,
-            TARGET_LEAD_GAIN,
-            TARGET_LEAD_MAX_PX,
-            FRAME_WIDTH,
-            FRAME_HEIGHT,
         )
         self.target_diameter_px = min(rect[2], rect[3])
         self.target_found = True
@@ -516,7 +606,7 @@ class TargetDetector:
         roi = self.target_rect
         if not self.target_found:
             margin = max(LASER_PREDICT_ROI_MARGIN_PX, self.target_diameter_px // 2)
-            roi = expand_rect(roi, margin)
+            roi = expand_rect(roi, margin, FRAME_WIDTH, FRAME_HEIGHT)
 
         blobs = img.find_blobs(
             [VIOLET_THRESHOLD],
@@ -589,7 +679,12 @@ class TargetDetector:
 
         corners = self.last_target_corners
         ordered_corners = normalize_corners(corners)
-        width_cm, height_cm = plane_size_cm_for_corners(ordered_corners)
+        width_cm, height_cm = plane_size_cm_for_corners(
+            ordered_corners,
+            TARGET_ASPECT,
+            TARGET_WIDTH_CM,
+            TARGET_HEIGHT_CM,
+        )
         plane_corners = (
             (-width_cm * 0.5, height_cm * 0.5),
             (width_cm * 0.5, height_cm * 0.5),
@@ -722,6 +817,7 @@ class AimingSystem:
         self.last_pitch_lead_cm = 0.0
         self.last_cmd_dx_cm = 0.0
         self.last_cmd_dy_cm = 0.0
+        self.last_reacquire_yaw_dir = 0
 
     def _update_start_button(self):
         if self.control_started:
@@ -824,6 +920,34 @@ class AimingSystem:
             "pitch_lead_cm": self.last_pitch_lead_cm * lead_scale,
         }
 
+    def _compute_reacquire_command(self, now_ms):
+        if self.last_valid_offset_ms is None:
+            return None
+        reacquire_age_ms = time.ticks_diff(now_ms, self.last_valid_offset_ms)
+        if reacquire_age_ms <= LOSS_HOLD_MS or reacquire_age_ms > LOSS_REACQUIRE_MS:
+            return None
+
+        yaw_dir = self.last_reacquire_yaw_dir
+        if yaw_dir == 0:
+            if abs(self.last_cmd_dx_cm) > 0.2:
+                yaw_dir = 1 if self.last_cmd_dx_cm > 0.0 else -1
+            elif abs(self.last_valid_base_dx_cm) > 0.2:
+                yaw_dir = 1 if self.last_valid_base_dx_cm > 0.0 else -1
+            elif abs(self.last_yaw_lead_cm) > 0.1:
+                yaw_dir = 1 if self.last_yaw_lead_cm > 0.0 else -1
+            else:
+                return None
+
+        cmd_dx = yaw_dir * LOSS_REACQUIRE_YAW_CMD_CM
+        cmd_dy = self.last_valid_base_dy_cm * LOSS_REACQUIRE_PITCH_HOLD_RATIO
+        cmd_dy = max(-PITCH_CMD_LIMIT_CM, min(PITCH_CMD_LIMIT_CM, cmd_dy))
+        return {
+            "cmd_dx_cm": cmd_dx,
+            "cmd_dy_cm": cmd_dy,
+            "reacquire_age_ms": reacquire_age_ms,
+            "yaw_dir": yaw_dir,
+        }
+
     def process_frame(self, img):
         self.frame_count += 1
         self.gc_counter += 1
@@ -847,23 +971,7 @@ class AimingSystem:
         if self.mode == "aim":
             if offset_info is None:
                 hold_command = self._compute_hold_command(now_ms)
-                if hold_command is None:
-                    self.control_state = "aim"
-                    self.turn_boost_active = False
-                    self.turn_boost_enter_count = 0
-                    self.turn_boost_exit_count = 0
-                    self.dx_growth_count = 0
-                    self.last_turn_eval_dx_cm = None
-                    self.motor.stop()
-                    control_debug.update({
-                        "state": self.control_state,
-                        "dx_rate_cm_s": self.last_visual_dx_rate,
-                        "dy_rate_cm_s": self.last_visual_dy_rate,
-                        "yaw_lead_cm": 0.0,
-                        "cmd_dx_cm": 0.0,
-                        "cmd_dy_cm": 0.0,
-                    })
-                else:
+                if hold_command is not None:
                     self.control_state = "loss_hold"
                     self.motor.drive(
                         hold_command["cmd_dx_cm"],
@@ -883,6 +991,44 @@ class AimingSystem:
                         "cmd_dx_cm": hold_command["cmd_dx_cm"],
                         "cmd_dy_cm": hold_command["cmd_dy_cm"],
                     })
+                else:
+                    reacquire_command = self._compute_reacquire_command(now_ms)
+                    if reacquire_command is not None:
+                        self.control_state = "loss_reacquire"
+                        self.motor.drive(
+                            reacquire_command["cmd_dx_cm"],
+                            reacquire_command["cmd_dy_cm"],
+                            allow_drive=self.control_started,
+                        )
+                        self.last_cmd_dx_cm = reacquire_command["cmd_dx_cm"]
+                        self.last_cmd_dy_cm = reacquire_command["cmd_dy_cm"]
+                        control_debug.update({
+                            "state": self.control_state,
+                            "dx_cm": self.last_valid_base_dx_cm,
+                            "dy_cm": self.last_valid_base_dy_cm,
+                            "dx_rate_cm_s": self.last_visual_dx_rate,
+                            "dy_rate_cm_s": self.last_visual_dy_rate,
+                            "yaw_lead_cm": self.last_yaw_lead_cm,
+                            "hold_age_ms": reacquire_command["reacquire_age_ms"],
+                            "cmd_dx_cm": reacquire_command["cmd_dx_cm"],
+                            "cmd_dy_cm": reacquire_command["cmd_dy_cm"],
+                        })
+                    else:
+                        self.control_state = "aim"
+                        self.turn_boost_active = False
+                        self.turn_boost_enter_count = 0
+                        self.turn_boost_exit_count = 0
+                        self.dx_growth_count = 0
+                        self.last_turn_eval_dx_cm = None
+                        self.motor.stop()
+                        control_debug.update({
+                            "state": self.control_state,
+                            "dx_rate_cm_s": self.last_visual_dx_rate,
+                            "dy_rate_cm_s": self.last_visual_dy_rate,
+                            "yaw_lead_cm": 0.0,
+                            "cmd_dx_cm": 0.0,
+                            "cmd_dy_cm": 0.0,
+                        })
             else:
                 dx_rate_cm_s, dy_rate_cm_s = self._compute_visual_rates(offset_info)
                 self._update_turn_boost_state(offset_info["dx_cm"], dx_rate_cm_s)
@@ -905,6 +1051,10 @@ class AimingSystem:
                 self.last_pitch_lead_cm = pitch_lead_cm
                 self.last_cmd_dx_cm = cmd_dx_cm
                 self.last_cmd_dy_cm = cmd_dy_cm
+                if abs(cmd_dx_cm) > 0.2:
+                    self.last_reacquire_yaw_dir = 1 if cmd_dx_cm > 0.0 else -1
+                elif abs(offset_info["dx_cm"]) > 0.2:
+                    self.last_reacquire_yaw_dir = 1 if offset_info["dx_cm"] > 0.0 else -1
                 self.control_state = "turn_boost" if self.turn_boost_active else "aim"
                 control_debug.update({
                     "state": self.control_state,

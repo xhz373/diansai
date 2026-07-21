@@ -390,18 +390,30 @@ class TargetDetector:
             corners = r.corners()
             if raw_rect is None or corners is None or len(corners) != 4:
                 continue
-            rect = compensate_edge_rect(raw_rect, reference_rect)
+            rect = compensate_edge_rect(
+                raw_rect,
+                reference_rect,
+                TARGET_EDGE_MARGIN_PX,
+                TARGET_EDGE_COMP_MIN_RATIO,
+                FRAME_WIDTH,
+                FRAME_HEIGHT,
+            )
             x, y, w, h = rect
             if w < TARGET_MIN_W or h < TARGET_MIN_H:
                 continue
             area = w * h
             if area < TARGET_MIN_AREA:
                 continue
-            if not rect_size_change_ok(rect, reference_rect):
+            if not rect_size_change_ok(rect, reference_rect, TARGET_MAX_SIZE_CHANGE_RATIO):
                 continue
 
-            center = rect_center_from_corners(corners)
-            border_hit_ratio = rect_border_hit_ratio(rect_img, rect)
+            center = rect_center_from_corners(corners, FRAME_WIDTH, FRAME_HEIGHT)
+            border_hit_ratio = rect_border_hit_ratio(
+                rect_img,
+                rect,
+                TARGET_BORDER_SAMPLE_COUNT,
+                corners,
+            )
             if border_hit_ratio < TARGET_BORDER_HIT_RATIO_MIN:
                 continue
             if reference_center is not None:
@@ -415,7 +427,9 @@ class TargetDetector:
                     or dist_sq(center, reference_center) > (TARGET_STICKY_DIST_PX * TARGET_STICKY_DIST_PX)
                 ):
                     continue
-            aspect_penalty = int(rect_aspect_error(w, h) * TARGET_ASPECT_PENALTY_SCALE)
+            aspect_penalty = int(
+                rect_aspect_error(w, h, TARGET_ASPECT) * TARGET_ASPECT_PENALTY_SCALE
+            )
             if reference_center is not None:
                 distance_penalty = dist_sq(center, reference_center) // 10
             else:
@@ -481,8 +495,8 @@ class TargetDetector:
         for blob in blobs:
             bx = blob.cx()
             by = blob.cy()
-            dist_sq = dist_sq((bx, by), self.target_center)
-            if dist_sq > gate_sq:
+            distance_sq = dist_sq((bx, by), self.target_center)
+            if distance_sq > gate_sq:
                 continue
             weight = max(1.0, float(blob.pixels()))
             weighted_x += bx * weight
@@ -562,6 +576,8 @@ class TargetDetector:
             previous_center,
             TARGET_LEAD_GAIN,
             TARGET_LEAD_MAX_PX,
+            FRAME_WIDTH,
+            FRAME_HEIGHT,
         )
         self.target_diameter_px = min(rect[2], rect[3])
         self.target_found = True
@@ -596,6 +612,8 @@ class TargetDetector:
             self.last_bullseye_center,
             BULLSEYE_LEAD_GAIN,
             BULLSEYE_LEAD_MAX_PX,
+            FRAME_WIDTH,
+            FRAME_HEIGHT,
         )
         self.last_bullseye_center = self.bullseye_center
         self.bullseye_found = True
@@ -609,7 +627,7 @@ class TargetDetector:
         roi = self.target_rect
         if not self.target_found:
             margin = max(LASER_PREDICT_ROI_MARGIN_PX, self.target_diameter_px // 2)
-            roi = expand_rect(roi, margin)
+            roi = expand_rect(roi, margin, FRAME_WIDTH, FRAME_HEIGHT)
 
         blobs = img.find_blobs(
             [VIOLET_THRESHOLD],
@@ -647,7 +665,7 @@ class TargetDetector:
                     LASER_STICKY_PX * 3,
                     LASER_STICKY_PX,
                 )
-            push_point_history(self.laser_spot_history, self.laser_spot)
+            push_point_history(self.laser_spot_history, self.laser_spot, LASER_POINT_HISTORY_LEN)
             self.laser_spot = filter_point_history(self.laser_spot_history)
             self.laser_found = True
             self.last_laser_spot = self.laser_spot
@@ -656,7 +674,7 @@ class TargetDetector:
             self.laser_miss_count += 1
             if self.last_laser_spot is not None and self.laser_miss_count <= LASER_MAX_MISS_FRAMES:
                 self.laser_spot = self.last_laser_spot
-                push_point_history(self.laser_spot_history, self.laser_spot)
+                push_point_history(self.laser_spot_history, self.laser_spot, LASER_POINT_HISTORY_LEN)
                 self.laser_spot = filter_point_history(self.laser_spot_history)
                 self.laser_found = True
             else:
@@ -777,7 +795,12 @@ class TargetDetector:
 
         corners = self.last_target_corners
         ordered_corners = normalize_corners(corners)
-        width_cm, height_cm = plane_size_cm_for_corners(ordered_corners)
+        width_cm, height_cm = plane_size_cm_for_corners(
+            ordered_corners,
+            TARGET_ASPECT,
+            TARGET_WIDTH_CM,
+            TARGET_HEIGHT_CM,
+        )
         plane_corners = (
             (-width_cm * 0.5, height_cm * 0.5),
             (width_cm * 0.5, height_cm * 0.5),

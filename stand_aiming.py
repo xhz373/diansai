@@ -9,22 +9,12 @@ from common_hw import (DebouncedButton as StartButton, Display, draw_text,
                        camera_init, camera_start, camera_snapshot,
                        camera_restart, camera_deinit, display_init)
 from vision_utils import (clamp_rect, dist_sq, smooth_center, apply_motion_lead,
-                          rect_aspect_error, rect_center_from_corners,
-                          rect_size_change_ok, compensate_edge_rect,
-                          rect_overlap_ratio, rect_border_hit_ratio,
-                          normalize_corners, compute_homography,
-                          apply_homography, log_info)
+                           rect_aspect_error, rect_center_from_corners,
+                           rect_size_change_ok, compensate_edge_rect,
+                           rect_overlap_ratio, rect_border_hit_ratio,
+                           normalize_corners, compute_homography,
+                           apply_homography, log_info)
 from pitch_search import PitchSearchController
-
-try:
-    import cv_lite
-except ImportError:
-    cv_lite = None
-
-try:
-    import image as image_module
-except ImportError:
-    image_module = None
 
 try:
     from k230_common import build_stepper_controller
@@ -45,49 +35,63 @@ except ImportError:
 CAMERA_ID = 2
 FRAME_WIDTH = 400
 FRAME_HEIGHT = 300
-SENSOR_HMIRROR = False
-SENSOR_VFLIP = False
+SENSOR_HMIRROR = True
+SENSOR_VFLIP = True
 START_BUTTON_BOARD_PIN = 28
 START_BUTTON_GPIO_NUM = 28
 RECT_THRESHOLD = 8000
-RECT_DARK_THRESHOLDS = ((0, 72), (0, 90))
-RECT_BORDER_THRESHOLD = RECT_DARK_THRESHOLDS[0]
+RECT_BORDER_THRESHOLD = (0, 90)
 RECT_TRACK_THRESHOLD = 25000
 RECT_GLOBAL_THRESHOLD = 20000
 RECT_TRACK_MAX_REGIONS = 2
 RECT_REACQUIRE_MAX_REGIONS = 4
-TARGET_WIDTH_CM = 25.0
-TARGET_HEIGHT_CM = 29.7
+TARGET_WIDTH_CM = 19.6
+TARGET_HEIGHT_CM = 28.0
 TARGET_ASPECT = TARGET_WIDTH_CM / TARGET_HEIGHT_CM
+# Image-space ratio used only to rank detected rectangles.  It is deliberately
+# independent of physical dimensions because camera pitch/yaw adds perspective.
+RECT_DETECT_ASPECT = 0.84
+RECT_DETECT_ASPECT_TOLERANCE = 0.35
 TARGET_ASPECT_PENALTY_SCALE = 12000
 TARGET_MIN_W = 44
 TARGET_MIN_H = 44
 TARGET_MIN_AREA = 3600
-TARGET_MAX_MISS_FRAMES = 3
+TARGET_MAX_JUMP_PX = 96
+TARGET_MAX_SIZE_CHANGE_RATIO = 0.35
+TARGET_EDGE_MARGIN_PX = 4
+TARGET_EDGE_COMP_MIN_RATIO = 0.55
+TARGET_MIN_OVERLAP_RATIO = 0.18
+TARGET_INIT_CENTER_BIAS = 14
+TARGET_NEAR_CENTER_PX = 180
+TARGET_BORDER_SAMPLE_COUNT = 10
+TARGET_BORDER_HIT_RATIO_MIN = 0.32
+TARGET_BORDER_SCORE_SCALE = 9000
+TARGET_MAX_MISS_FRAMES = 10
 TARGET_REACQUIRE_FRAMES = 24
 TARGET_REACQUIRE_GLOBAL_AFTER = 4
 TARGET_DETECT_INTERVAL = 1
 TARGET_STABLE_FRAMES = 3
-TARGET_CENTER_ALPHA = 1.00
-TARGET_CENTER_RESET_PX = 72
+TARGET_CENTER_ALPHA = 0.65
+TARGET_CENTER_RESET_PX = 50
 TARGET_CENTER_STICKY_PX = 2
-TARGET_CORNER_ALPHA = 1.00
-TARGET_CORNER_RESET_PX = 72
-TARGET_CORNER_STEP_LIMIT_PX = 96
-CONTROL_CENTER_ALPHA_IDLE = 0.40
-CONTROL_CENTER_ALPHA_DRIVE = 0.50
+TARGET_CORNER_STEP_LIMIT_PX = 120
+CONTROL_CENTER_ALPHA_IDLE = 0.65
+CONTROL_CENTER_ALPHA_DRIVE = 0.60
 CONTROL_CORNER_ALPHA_IDLE = 0.42
-CONTROL_CORNER_ALPHA_DRIVE = 0.50
-CONTROL_FILTER_RESET_PX = 96
+CONTROL_CORNER_ALPHA_DRIVE = 0.60
+CONTROL_FILTER_RESET_PX = 80
 CONTROL_FILTER_STICKY_PX = 2
-CONTROL_FILTER_DRIVE_ERROR_CM = 0.35
+CONTROL_FILTER_DRIVE_ERROR_CM = 0.60
 CONTROL_ERROR_ALPHA_IDLE = 0.65
 CONTROL_ERROR_ALPHA_DRIVE = 0.35
 CONTROL_ERROR_RESET_CM = 2.5
+# Keep motor velocity continuous across one or two missed detections.  Longer
+# losses still stop immediately and follow the normal yaw-search path.
+CONTROL_STALE_DRIVE_FRAMES = 2
 MAX_AIM_ERROR_CM = 2.0
-ALIGNED_TOLERANCE_CM = 1.2
-LASER_DOT_X_PX = 188
-LASER_DOT_Y_PX = 135
+ALIGNED_TOLERANCE_CM = 0.9
+LASER_DOT_X_PX = 234 #越大越左
+LASER_DOT_Y_PX = 125 #越大越上
 DEBUG_MODE = True
 DEBUG_TEXT_OVERLAY = True
 FRAME_LOOP_DELAY_MS = 0
@@ -102,7 +106,7 @@ PITCH_SEARCH_ERROR_CM = 2.0
 PITCH_SEARCH_SEGMENTS = ((1, 700), (0, 150), (-1, 1400), (0, 150), (1, 700), (0, 800))
 YAW_SEARCH_ENABLED = True
 YAW_SEARCH_START_DELAY_MS = 200
-YAW_SEARCH_FREQ_HZ = 150  #测试完改回300
+YAW_SEARCH_FREQ_HZ = 100  #测试完改回300
 YAW_SEARCH_DIRECTION = -1
 YAW_SEARCH_HALF_TURN_STEPS = 1600
 YAW_SEARCH_REVERSE_PAUSE_MS = 120
@@ -115,23 +119,25 @@ STEPPER_AXIS_OVERRIDES = {
         "pid_kp": 0.1,
         "pid_ki": 0.0,
         "pid_kd": 0.0,      # 彻底关掉 Kd
-        "min_freq": 80,
-        "max_freq": 200,
-        "manual_max_freq": 1000,
-        "ramp_hz_per_s": 300.0,
+        "min_freq": 100,
+        "max_freq": 400,
+        "manual_max_freq": 600,
+        "ramp_hz_per_s": 500.0,
         "integral_limit": 10.0,
         "integral_active_error": 3.0,
     },
     "y": {
-        "deadband": float(ALIGNED_TOLERANCE_CM) * 1.35,
+        "deadband": float(ALIGNED_TOLERANCE_CM) * 1.6, # 原1.35。稍微放大Y轴死区，允许轻微偏心，防止反复微调
         "error_full_scale": 20.0,
-        "command_sign": 1,
-        "pid_kp": 0.07,
+        "command_sign": -1,
+        # pid_kp is Hz/cm in k230_common.  It must be comparable with
+        # min_freq; 0.1 made every nonzero Y command clamp to one speed.
+        "pid_kp": 70.0,
         "pid_ki": 0.0,
         "pid_kd": 0.0,
         "min_freq": 60,
-        "max_freq": 180,
-        "ramp_hz_per_s": 120.0,
+        "max_freq": 200,         # 原400。降低Y轴最高限速
+        "ramp_hz_per_s": 600.0,
         "integral_limit": 10.0,
         "integral_active_error": 3.0,
     },
@@ -169,30 +175,93 @@ class RectTracker:
         
         return (tl, tr, br, bl)
 
-    def _smooth_corners(self, corners, previous_corners):
-        current = self._sort_corners_fixed(corners)
-        if previous_corners is None or len(previous_corners) != 4:
-            return tuple((int(p[0]), int(p[1])) for p in current)
+    def _prepare_rect_image(self, img):
+        rect_img = img.to_grayscale()
         
-        previous = self._sort_corners_fixed(previous_corners)
-        smoothed = []
-        reset_sq = TARGET_CORNER_RESET_PX * TARGET_CORNER_RESET_PX
-        for idx in range(4):
-            prev_x, prev_y = previous[idx]
-            curr_x, curr_y = current[idx]
-            dx = curr_x - prev_x
-            dy = curr_y - prev_y
-            if dx * dx + dy * dy > reset_sq:
-                smoothed.append((int(curr_x), int(curr_y)))
+        # 1. 第一关：二值化，非黑即白
+        rect_img.binary([RECT_BORDER_THRESHOLD])
+        
+        # ==========================================
+        # 【应用第二关知识：形态学处理，从源头扼杀抖动】
+        
+        # 绝招 A：闭运算 (先膨胀，后腐蚀)
+        # 作用：如果标靶上有胶带反光造成的黑色小破洞，或者边缘有向内凹陷的坑。
+        # 膨胀会把洞填满，腐蚀会让矩形恢复原大小。边缘瞬间变得像刀切一样笔直！
+        rect_img.dilate(1)
+        
+        # ==========================================
+        
+        return rect_img
+
+    def _select_best_rect(self, rect_img, rects, previous_center, previous_rect):
+        best = None
+        best_score = None
+        image_center = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
+
+        for r in rects:
+            raw_rect = r.rect()
+            corners = r.corners()
+            if raw_rect is None or corners is None or len(corners) != 4:
                 continue
 
-            limited_x = prev_x + max(-TARGET_CORNER_STEP_LIMIT_PX, min(TARGET_CORNER_STEP_LIMIT_PX, dx))
-            limited_y = prev_y + max(-TARGET_CORNER_STEP_LIMIT_PX, min(TARGET_CORNER_STEP_LIMIT_PX, dy))
-            smoothed.append((
-                int(prev_x * (1.0 - TARGET_CORNER_ALPHA) + limited_x * TARGET_CORNER_ALPHA),
-                int(prev_y * (1.0 - TARGET_CORNER_ALPHA) + limited_y * TARGET_CORNER_ALPHA),
-            ))
-        return tuple(smoothed)
+            rect = compensate_edge_rect(
+                raw_rect,
+                previous_rect,
+                TARGET_EDGE_MARGIN_PX,
+                TARGET_EDGE_COMP_MIN_RATIO,
+                FRAME_WIDTH,
+                FRAME_HEIGHT,
+            )
+            x, y, w, h = rect
+            if w < TARGET_MIN_W or h < TARGET_MIN_H or w * h < TARGET_MIN_AREA:
+                continue
+            if not rect_size_change_ok(rect, previous_rect, TARGET_MAX_SIZE_CHANGE_RATIO):
+                continue
+
+            current_aspect = float(w) / float(h)
+            aspect_error = abs(current_aspect - RECT_DETECT_ASPECT)
+            if aspect_error > RECT_DETECT_ASPECT_TOLERANCE:
+                continue
+
+            center = rect_center_from_corners(corners, FRAME_WIDTH, FRAME_HEIGHT)
+            border_hit_ratio = rect_border_hit_ratio(
+                rect_img,
+                rect,
+                TARGET_BORDER_SAMPLE_COUNT,
+                corners,
+            )
+            if border_hit_ratio < TARGET_BORDER_HIT_RATIO_MIN:
+                continue
+
+            if previous_center is not None:
+                jump_sq = dist_sq(center, previous_center)
+                if jump_sq > (TARGET_MAX_JUMP_PX * TARGET_MAX_JUMP_PX):
+                    continue
+            else:
+                jump_sq = dist_sq(center, image_center)
+
+            if previous_rect is not None:
+                overlap_ratio = rect_overlap_ratio(rect, previous_rect)
+                if overlap_ratio < TARGET_MIN_OVERLAP_RATIO and (
+                        previous_center is None
+                        or dist_sq(center, previous_center) >
+                        (TARGET_CENTER_STICKY_PX * TARGET_CENTER_STICKY_PX)):
+                    continue
+
+            score = w * h
+            score -= int(aspect_error * TARGET_ASPECT_PENALTY_SCALE)
+            score -= jump_sq // 10 if previous_center is not None else jump_sq // TARGET_INIT_CENTER_BIAS
+            score += int(border_hit_ratio * TARGET_BORDER_SCORE_SCALE)
+            if x <= 2 or y <= 2 or x + w >= FRAME_WIDTH - 2 or y + h >= FRAME_HEIGHT - 2:
+                score -= 3600
+            if dist_sq(center, image_center) <= TARGET_NEAR_CENTER_PX * TARGET_NEAR_CENTER_PX:
+                score += 2000
+
+            if best_score is None or score > best_score:
+                best_score = score
+                best = (r, rect, corners)
+
+        return best
 
     def detect(self, img, force_global=False):
         self.frame_id += 1
@@ -200,16 +269,17 @@ class RectTracker:
             return self.target_found, self.target_rect, self.target_center
 
         previous_center = None if force_global else self.last_target_center
-        previous_corners = self.last_target_corners
-        previous_rect = None if force_global else (self.target_rect or self.search_anchor_rect)
+        previous_rect = None if force_global else (self.search_anchor_rect or self.target_rect)
         
         self.target_found = False
         self.target_fresh = False
 
         # 【终极防爆优化】锁死追踪 ROI，绝不放开全局边缘扫描
-        if previous_rect is not None:
+        if force_global:
+            search_roi = (0, 0, FRAME_WIDTH, FRAME_HEIGHT)
+        elif previous_rect is not None:
             px, py, pw, ph = previous_rect
-            pad = 30 if self.target_rect is not None else 80
+            pad = 80 if self.target_rect is not None else 100
             rx = max(0, px - pad)
             ry = max(0, py - pad)
             rw = min(FRAME_WIDTH - rx, pw + pad * 2)
@@ -219,71 +289,42 @@ class RectTracker:
             search_roi = (40, 30, FRAME_WIDTH - 80, FRAME_HEIGHT - 60)
 
         # 【物理防爆防御】高阈值 + max_regions=2 限制线段总数，外加 try-except 保护机制
+        rect_img = None
         rects = []
-        rect_keys = []
         scan_threshold = RECT_TRACK_THRESHOLD if previous_rect is not None else RECT_GLOBAL_THRESHOLD
         scan_max_regions = RECT_TRACK_MAX_REGIONS if previous_rect is not None else RECT_REACQUIRE_MAX_REGIONS
         try:
-            local_rects = img.find_rects(
+            rect_img = self._prepare_rect_image(img)
+            rects = rect_img.find_rects(
                 roi=search_roi,
                 threshold=scan_threshold,
-                max_regions=scan_max_regions
+                max_regions=scan_max_regions,
             ) or []
-            for r in local_rects:
-                key = r.rect()
-                if key not in rect_keys:
-                    rect_keys.append(key)
-                    rects.append(r)
         except (RuntimeError, MemoryError):
             gc.collect()
 
-        if self.target_rect is None and self.target_miss_count >= TARGET_REACQUIRE_GLOBAL_AFTER:
+        if (rect_img is not None and self.target_rect is None
+                and self.target_miss_count >= TARGET_REACQUIRE_GLOBAL_AFTER):
             global_roi = (40, 30, FRAME_WIDTH - 80, FRAME_HEIGHT - 60)
             if global_roi != search_roi:
                 try:
-                    global_rects = img.find_rects(
+                    global_rects = rect_img.find_rects(
                         roi=global_roi,
                         threshold=RECT_GLOBAL_THRESHOLD,
-                        max_regions=RECT_REACQUIRE_MAX_REGIONS
+                        max_regions=RECT_REACQUIRE_MAX_REGIONS,
                     ) or []
-                    for r in global_rects:
-                        key = r.rect()
-                        if key not in rect_keys:
-                            rect_keys.append(key)
-                            rects.append(r)
+                    rects.extend(global_rects)
                 except (RuntimeError, MemoryError):
                     gc.collect()
 
-        best_rect_obj = None
-        best_score = None
-        best_corners = None
-        
-        if rects:
-            for r in rects:
-                x, y, w, h = r.rect()
-                if w < TARGET_MIN_W or h < TARGET_MIN_H: continue
-                if x <= 1 or y <= 1 or x + w >= FRAME_WIDTH - 1 or y + h >= FRAME_HEIGHT - 1: continue
-                
-                current_aspect = float(w) / float(h)
-                aspect_error = abs(current_aspect - TARGET_ASPECT)
-                if aspect_error > 0.22: continue  
-                
-                c = r.corners()
-                if not c or len(c) != 4: continue
-                
-                score = w * h
-                score -= int(aspect_error * TARGET_ASPECT_PENALTY_SCALE)
-                
-                if previous_center:
-                    cx = x + w / 2.0
-                    cy = y + h / 2.0
-                    d_sq = (cx - previous_center[0])**2 + (cy - previous_center[1])**2
-                    score -= int(d_sq * 2.0)
-                
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_rect_obj = r
-                    best_corners = c
+        best = self._select_best_rect(rect_img, rects, previous_center, previous_rect)
+
+        if best is not None:
+            best_rect_obj, best_rect, best_corners = best
+        else:
+            best_rect_obj = None
+            best_rect = None
+            best_corners = None
 
         # 丢失记忆与重置
         if not best_rect_obj or best_corners is None:
@@ -307,10 +348,14 @@ class RectTracker:
         self.target_fresh = True
 
         # 计算当前的几何测量数据，直接作为输出值使用
-        meas_cx = sum(p[0] for p in best_corners) / 4.0
-        meas_cy = sum(p[1] for p in best_corners) / 4.0
-        xs = [p[0] for p in best_corners]
-        ys = [p[1] for p in best_corners]
+        # Never blend individual corners with an earlier measurement.  A
+        # complete current-frame quadrilateral is required for homography;
+        # during a short loss the previous complete measurement is held above.
+        self.target_corners = self._sort_corners_fixed(best_corners)
+        meas_cx = sum(p[0] for p in self.target_corners) / 4.0
+        meas_cy = sum(p[1] for p in self.target_corners) / 4.0
+        xs = [p[0] for p in self.target_corners]
+        ys = [p[1] for p in self.target_corners]
         meas_w = max(xs) - min(xs)
         meas_h = max(ys) - min(ys)
 
@@ -320,11 +365,9 @@ class RectTracker:
         rx = int(meas_cx - meas_w / 2.0)
         ry = int(meas_cy - meas_h / 2.0)
         self.target_rect = (rx, ry, int(meas_w), int(meas_h))
-        self.search_anchor_rect = self.target_rect
+        self.search_anchor_rect = best_rect
 
         # 同时平滑四角，确保你后面的 Homography 透视映射矩阵极其丝滑
-        self.target_corners = self._sort_corners_fixed(best_corners)
-
         self.last_target_center = self.target_center
         self.last_target_corners = self.target_corners
         
@@ -575,17 +618,26 @@ class RectCenterSystem:
         previous = normalize_corners(self.filtered_control_corners)
         reset_sq = CONTROL_FILTER_RESET_PX * CONTROL_FILTER_RESET_PX
         smoothed = []
+        
         for idx in range(4):
             prev_x, prev_y = previous[idx]
             curr_x, curr_y = current[idx]
             dx = curr_x - prev_x
             dy = curr_y - prev_y
+            
             if dx * dx + dy * dy > reset_sq:
                 smoothed.append((int(curr_x), int(curr_y)))
                 continue
 
+            # 【新增：静止防抖死区】如果角点只跳动不到 2 个像素，强制钉死不动！
+            if abs(dx) <= 3 and abs(dy) <= 3:
+                smoothed.append((int(prev_x), int(prev_y)))
+                continue
+
             limited_x = prev_x + max(-TARGET_CORNER_STEP_LIMIT_PX, min(TARGET_CORNER_STEP_LIMIT_PX, dx))
             limited_y = prev_y + max(-TARGET_CORNER_STEP_LIMIT_PX, min(TARGET_CORNER_STEP_LIMIT_PX, dy))
+            
+            # 一阶低通滤波
             smoothed.append((
                 int(prev_x * (1.0 - alpha) + limited_x * alpha),
                 int(prev_y * (1.0 - alpha) + limited_y * alpha),
@@ -593,7 +645,6 @@ class RectCenterSystem:
 
         self.filtered_control_corners = tuple(smoothed)
         return self.filtered_control_corners
-
     def process_frame(self, img):
         self.frame_count += 1
         self.gc_counter += 1
@@ -633,38 +684,56 @@ class RectCenterSystem:
                                        target_corners=self.tracker.target_corners)
                 return img
 
-        _rx, _ry, rw, rh = rect
+        # 1. 过滤中心点
+        smooth_center = self._smooth_control_center(center)
+        # 2. 过滤四个角点
+        smooth_corners = self._smooth_control_corners(self.tracker.target_corners)
+        
+        # 3. 根据过滤后的平稳角点，重新计算一个平稳的矩形框用于画图和逻辑
+        if smooth_corners and len(smooth_corners) == 4:
+            xs = [p[0] for p in smooth_corners]
+            ys = [p[1] for p in smooth_corners]
+            smooth_rect = (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+        else:
+            smooth_rect = rect
+
+        _rx, _ry, rw, rh = smooth_rect
         px_per_cm_x = rw / TARGET_WIDTH_CM if rw > 0 else 4.0
         px_per_cm_y = rh / TARGET_HEIGHT_CM if rh > 0 else 4.0
 
         target_point_px = (LASER_DOT_X_PX, LASER_DOT_Y_PX)
         target_fresh = self.tracker.target_fresh
-        dx, dy = self._compute_aim_error(rect, self.tracker.target_corners, target_point_px, center)
-
-        dx = max(-MAX_AIM_ERROR_CM, min(MAX_AIM_ERROR_CM, dx))
-        dy = max(-MAX_AIM_ERROR_CM, min(MAX_AIM_ERROR_CM, dy))
-        self._drive_filter_active = (
-            self.control_started
-            and target_fresh
-            and (abs(dx) > CONTROL_FILTER_DRIVE_ERROR_CM or abs(dy) > CONTROL_FILTER_DRIVE_ERROR_CM)
+        stale_glide = (
+            (not target_fresh)
+            and self.tracker.target_miss_count <= CONTROL_STALE_DRIVE_FRAMES
         )
-        dx, dy = self._filter_control_error(dx, dy)
+        
+        # Control must use the current camera measurement.  The smoothed
+        # geometry below is display-only; feeding it back adds frame delay.
+        dx, dy = self._compute_aim_error(
+            rect,
+            self.tracker.target_corners,
+            target_point_px,
+            center,
+        )
 
         tolerance_px = int(ALIGNED_TOLERANCE_CM * max(px_per_cm_x, px_per_cm_y))
         aligned = (target_fresh and abs(dx) <= ALIGNED_TOLERANCE_CM and abs(dy) <= ALIGNED_TOLERANCE_CM)
         self.last_aligned = aligned
         
-        self.motor.drive(dx, dy, allow_drive=self.control_started and target_fresh and (not aligned))
+        allow_tracking_drive = self.control_started and (target_fresh or stale_glide) and (not aligned)
+        self.motor.drive(dx, dy, allow_drive=allow_tracking_drive)
         self._aligned_latched = aligned
         
         if not self.control_started: self._report_control_state("CONTROL DISABLED", dx, dy)
+        elif stale_glide: self._report_control_state("TRACK GLIDE", dx, dy)
         elif not target_fresh: self._report_control_state("TRACK HOLD", dx, dy)
         elif aligned: self._report_control_state("ALIGNED -> MOTOR HOLD", dx, dy)
         else: self._report_control_state("DRIVING", dx, dy)
 
         if DEBUG_MODE:
-            self._draw_overlay(img, rect, center, screen_center, target_point_px,
-                               aligned, tolerance_px, dx, dy, target_corners=self.tracker.target_corners)
+            self._draw_overlay(img, smooth_rect, smooth_center, screen_center, target_point_px,
+                               aligned, tolerance_px, dx, dy, target_corners=smooth_corners)
         return img
 
     def _draw_overlay(self, img, rect, center, screen_center, target_point,

@@ -383,10 +383,14 @@ def normalize_corners(corners):
 
 def plane_size_cm_for_corners(corners, target_aspect, width_cm, height_cm):
     """Determine whether corners represent portrait or landscape target."""
-    top    = math.hypot(corners[1][0] - corners[0][0], corners[1][1] - corners[0][1])
-    right  = math.hypot(corners[2][0] - corners[1][0], corners[2][1] - corners[1][1])
-    bottom = math.hypot(corners[2][0] - corners[3][0], corners[2][1] - corners[3][1])
-    left   = math.hypot(corners[3][0] - corners[0][0], corners[3][1] - corners[0][1])
+    top_dx, top_dy = corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]
+    right_dx, right_dy = corners[2][0] - corners[1][0], corners[2][1] - corners[1][1]
+    bottom_dx, bottom_dy = corners[2][0] - corners[3][0], corners[2][1] - corners[3][1]
+    left_dx, left_dy = corners[3][0] - corners[0][0], corners[3][1] - corners[0][1]
+    top = (top_dx * top_dx + top_dy * top_dy) ** 0.5
+    right = (right_dx * right_dx + right_dy * right_dy) ** 0.5
+    bottom = (bottom_dx * bottom_dx + bottom_dy * bottom_dy) ** 0.5
+    left = (left_dx * left_dx + left_dy * left_dy) ** 0.5
     w_px, h_px = (top + bottom) * 0.5, (left + right) * 0.5
     aspect = w_px / max(h_px, 1e-6)
     if abs(aspect - (1.0 / target_aspect)) < abs(aspect - target_aspect):
