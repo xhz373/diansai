@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "D:\\ccs\\elelctric_competition\\gimbal_k230\\diansai\\datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "889e8405358c953f885c945d664fde84df02bec8c179c36fc45619095d1ecbd7",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": false
+}
