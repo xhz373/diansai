@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# nncase compiler and simulator scratch data
+gmodel_dump_dir/
+tmp/
+tmp_yolo/
+tmp_yolo_gfl/
+tmp_yolo_topk/
+
+# Reproducible local validation artifact and manual preview image
+steelball_yolov8n_320_uint8.kmodel
+steel-ball-preview.jpg
+
+# Local archive of superseded experiments
+_archive/

@@ -4,10 +4,36 @@ import os
 import sys
 import time
 
-from common_hw import (Display, MultiButton, draw_text,
-                        camera_init, camera_start, camera_snapshot,
-                        camera_deinit,
-                        init_board_display)
+
+def _append_import_paths():
+    for candidate in (
+        ".",
+        "/flash",
+        "/flash/app",
+        "/flash/lib",
+        "/sdcard",
+        "/sdcard/app",
+        "/sdcard/lib",
+    ):
+        try:
+            if candidate not in sys.path:
+                sys.path.append(candidate)
+        except Exception:
+            pass
+
+
+_append_import_paths()
+
+try:
+    from common_hw import (Display, MultiButton, draw_text,
+                           camera_init, camera_start, camera_snapshot,
+                           camera_deinit,
+                           display_init_board)
+except ImportError:
+    raise ImportError(
+        "common_hw not found; copy common_hw.py to /flash, /flash/app, "
+        "/flash/lib, /sdcard, /sdcard/app, or /sdcard/lib before running."
+    )
 
 try:
     from k230_common import load_calibration, save_calibration
@@ -275,7 +301,7 @@ def main():
     print("build:", BUILD_TAG)
     print("=" * 50)
 
-    init_board_display()
+    display_init_board()
     calibrator = ThresholdCalibrator()
     kw = dict(camera_id=CAMERA_ID, width=FRAME_WIDTH, height=FRAME_HEIGHT,
               hmirror=SENSOR_HMIRROR, vflip=SENSOR_VFLIP)

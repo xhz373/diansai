@@ -5,7 +5,7 @@ from machine import FPIOA, Pin
 
 from common_hw import map_gpio, pin_pull_up
 
-FLAG = 2
+FLAG = 0
 FLAG_SEQUENCE = (0, 1, 2, 3, 4, 5, 6)
 IDLE_FLAG = 1
 FLAG_MAP = {
